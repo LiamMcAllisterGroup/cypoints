@@ -1,0 +1,28 @@
+# Environment for cypoints: point generation and integration weights on toric
+# Calabi-Yau hypersurfaces.
+#
+#   mamba env create -f environment.yml --yes
+#
+# The core is numpy-only. Uncomment the jax block for the GPU variants; pick
+# the wheel matching your CUDA, and note that consumer cards run fp64 at a
+# small fraction of fp32, so the GPU path is mixed precision by design.
+name: cypoints
+channels:
+  - conda-forge
+dependencies:
+  # core
+  - python
+  - numpy
+  - scipy
+  # tests
+  - pytest
+  - pip
+  - pip:
+    # toric geometry: rays, GLSM, intersection numbers, Kahler cone
+    - cytools @ git+https://github.com/LiamMcAllisterGroup/cytools.git
+    # lattice-point enumeration, for the section monomials
+    - latticepts
+    # GPU variants (optional)
+    # - jax[cuda12]
+    # cross-checking the weights against an independent implementation
+    # - cymetric @ git+https://github.com/natemacfadden/cymetric.git
