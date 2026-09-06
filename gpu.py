@@ -108,6 +108,23 @@ def weights(cyd: CYData, z: ArrayLike, normalize: bool = True) -> jnp.ndarray:
     Integration weights on the GPU; see `measure.weights` for the definition.
     """
     z = jnp.asarray(z, dtype=jnp.complex128)
+    return _weigher(cyd, z.shape, normalize)(z)[0]
+
+
+def measure_all(cyd: CYData, z: ArrayLike, normalize: bool = True) -> tuple:
+    """
+    Weights, holomorphic volume form and pullbacks in one program: the weights
+    need Omega and the pullbacks anyway, so this costs the same as `weights`.
+
+    Returns
+    -------
+    w : (n_p,) float64
+    omega : (n_p,) complex128
+        1 / dQ/dz_j on the eliminated coordinate, as `measure.omega`.
+    pullbacks : (n_p, dim, ncoords) complex128
+        As `measure.pullbacks`.
+    """
+    z = jnp.asarray(z, dtype=jnp.complex128)
     return _weigher(cyd, z.shape, normalize)(z)
 
 
@@ -119,27 +136,42 @@ def weights(cyd: CYData, z: ArrayLike, normalize: bool = True) -> jnp.ndarray:
 _COMPILED: dict = {}
 
 
+def _geometry(cyd) -> tuple:
+    """
+    What the programs are specialised on: the polytope data, not the
+    coefficients. The coefficients (the complex-structure moduli) and the
+    volume normalisation enter as traced arguments, so a scan over moduli
+    reuses one compiled program per size.
+    """
+    return (np.asarray(cyd.exponents).tobytes(), int(cyd.ncoords), int(cyd.dim),
+            tuple(len(sec) for sec in cyd.sections), np.asarray(cyd.glsm).tobytes())
+
+
 def _generator(cyd, factors_t, line_t, d, n_lines, n_p, acc):
-    key = ("gen", id(cyd), factors_t, line_t, d, n_lines, n_p, acc)
+    key = ("gen", _geometry(cyd), factors_t, line_t, d, n_lines, n_p, acc)
     if key not in _COMPILED:
         factors = [np.array(f) for f in factors_t]
         line    = np.array(line_t)
-        _COMPILED[key] = jax.jit(
-            lambda prng: _generate(cyd, factors, line, d, n_lines, n_p,
-                                   acc, prng))
-    return _COMPILED[key]
+        fn = jax.jit(lambda prng, cfs: _generate(cyd, factors, line, d, n_lines, n_p,
+                                                 acc, prng, cfs))
+        _COMPILED[key] = fn
+    fn = _COMPILED[key]
+    cfs = jnp.asarray(cyd.coefficients, dtype=jnp.complex128)
+    return lambda prng: fn(prng, cfs)
 
 
 def _weigher(cyd, shape, normalize):
-    key = ("wts", id(cyd), shape, normalize)
+    key = ("wts", _geometry(cyd), shape, normalize)
     if key not in _COMPILED:
-        _COMPILED[key] = jax.jit(lambda z: _weights(cyd, z, normalize))
-    return _COMPILED[key]
+        _COMPILED[key] = jax.jit(lambda z, cfs, vol: _weights(cyd, z, normalize, cfs, vol))
+    fn  = _COMPILED[key]
+    cfs = jnp.asarray(cyd.coefficients, dtype=jnp.complex128)
+    vol = jnp.asarray(cyd.vol_j_norm, dtype=jnp.float64)
+    return lambda z: fn(z, cfs, vol)
 
 
-def _generate(cyd, factors, line, d, n_lines, n_p, acc, key):
+def _generate(cyd, factors, line, d, n_lines, n_p, acc, key, cfs):
     exps   = np.asarray(cyd.exponents)
-    cfs    = jnp.asarray(cyd.coefficients)
     ncoord = cyd.ncoords
 
     keys = jax.random.split(key, len(factors) + 1)
@@ -173,9 +205,8 @@ def _generate(cyd, factors, line, d, n_lines, n_p, acc, key):
     return z[order[:n_p]]
 
 
-def _weights(cyd, z, normalize):
+def _weights(cyd, z, normalize, cfs, vol_j_norm):
     exps = np.asarray(cyd.exponents)
-    cfs  = jnp.asarray(cyd.coefficients)
 
     dQ     = poly.gradient(z, exps, cfs, xp=jnp)
     j_elim = jnp.argmax(jnp.abs(dQ) * ~_is_one(z), axis=-1)
@@ -193,8 +224,8 @@ def _weights(cyd, z, normalize):
 
     if normalize:
         det_ref = jnp.real(jnp.linalg.det(sum(gp)))
-        w       = w * cyd.vol_j_norm / jnp.mean(det_ref / det_g)
-    return w
+        w       = w * vol_j_norm / jnp.mean(det_ref / det_g)
+    return w, om, pbs
 
 
 # helpers

@@ -60,7 +60,8 @@ def prepare_dataset(cyd: CYData,
                     val_split: float = 0.1,
                     ltails: float = 0.0,
                     rtails: float = 0.0,
-                    seed: int = 0) -> float:
+                    seed: int = 0,
+                    device: str = "cpu") -> float:
     """
     Sample points and write `dirname/dataset.npz` in cymetric's layout.
 
@@ -84,6 +85,10 @@ def prepare_dataset(cyd: CYData,
         distribution. Defaults to 0.0.
     seed : int, optional
         Seed for the sampling. Defaults to 0.
+    device : {"cpu", "gpu"}, optional
+        "gpu" samples and weighs with `cypoints.gpu` (JAX, float64; the x64
+        flag is switched on only for the calls). The two paths agree to
+        1e-15 but are different random sequences. Defaults to "cpu".
 
     Returns
     -------
@@ -93,24 +98,37 @@ def prepare_dataset(cyd: CYData,
     os.makedirs(dirname, exist_ok=True)
 
     n_gen = int(round(n_p / (1.0 - ltails - rtails)))
-    z     = generate_points(cyd, n_gen, seed=seed)
+    if device == "gpu":
+        import jax
+        x64 = jax.config.jax_enable_x64          # read before importing gpu, which sets it
+        from . import gpu
+        try:
+            jax.config.update("jax_enable_x64", True)
+            z          = np.asarray(gpu.generate_points(cyd, n_gen, seed=seed))
+            w, om, pbs = (np.asarray(a) for a in gpu.measure_all(cyd, z))
+        finally:
+            jax.config.update("jax_enable_x64", x64)
+    else:
+        z   = generate_points(cyd, n_gen, seed=seed)
+        w   = measure.weights(cyd, z)
+        om  = measure.omega(cyd, z)
+        pbs = measure.pullbacks(cyd, z)
     # the sampler returns the lines factor by factor, so a positional split
     # would hold out a single factor; every subset must be the full mixture
-    z     = z[np.random.default_rng(seed).permutation(len(z))]
-    w     = measure.weights(cyd, z)
-    om    = measure.omega(cyd, z)
+    order = np.random.default_rng(seed).permutation(len(z))
+    z, w, om, pbs = z[order], w[order], om[order], pbs[order]
     om2   = np.real(om * np.conj(om))
 
     if ltails or rtails:
         order = np.argsort(w)
         keep  = order[round(ltails * n_gen):round((1.0 - rtails) * n_gen)]
-        z, w, om2 = z[keep], w[keep], om2[keep]
+        z, w, om2, pbs = z[keep], w[keep], om2[keep], pbs[keep]
 
     kappa = compute_kappa(cyd, z, w, om2)
 
     # to cymetric's block-per-factor coordinate order
     perm = coord_permutation(cyd)
-    pbs  = measure.pullbacks(cyd, z)[:, :, perm]
+    pbs  = pbs[:, :, perm]
     z    = z[:, perm]
 
     n_train = int((1.0 - val_split) * len(z))
