@@ -167,17 +167,22 @@ def fs_rank(cyd: CYData, z: ArrayLike, tol: float = 1e-8) -> int:
     return int((np.median(ev, axis=0) > tol * np.median(ev.max(axis=1))).sum())
 
 
-def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, **mc) -> tuple:
+def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, method: str = "jax",
+           walkers: int = 4096, **mc) -> tuple:
     """
     Points, weights, Omega and pullbacks on a general toric hypersurface.
 
-    cymetric's `ToricPointGeneratorMC` samples |Omega|^2 directly (tangent-space
-    Metropolis-Hastings with tuned step, burn-in and thinning), so the weights
-    are uniform, normalised so that the flat measure w/|Omega|^2 integrates the
-    Fubini-Study volume form at `cyd.kahler` to kappa(J,J,J), J = kc_rays^T t
-    the class of the Kahler form in the divisor basis; the assignment mixture of
-    `measure.weights` is not needed. Serial numpy: expect ~10^3 points/s, not
-    the GPU line method's 10^7.
+    The Metropolis-Hastings chain samples |Omega|^2 directly (tangent-space
+    proposal, Newton projection, tuned step, burn-in and thinning), so the
+    weights are uniform, normalised so that the flat measure w/|Omega|^2
+    integrates the Fubini-Study volume form at `cyd.kahler` to kappa(J,J,J),
+    J = kc_rays^T t the class of the Kahler form in the divisor basis; the
+    assignment mixture of `measure.weights` is not needed.
+
+    method="jax" (default) runs `walkers` chains together in one jitted program
+    per step (`toric_mc.sample`, ~10^4-10^5 points/s on a GPU, x64 switched on
+    for the call and restored); method="numpy" is cymetric's serial
+    `ToricPointGeneratorMC` (~10^2 points/s), kept as the reference.
 
     Parameters
     ----------
@@ -185,7 +190,11 @@ def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, **mc) -> tupl
     n_p : int
     seed : int, optional
     verbose : int, optional
-        Forwarded to the generator (cymetric hides its progress bar above 2). Defaults to 3.
+        For method="numpy": forwarded to cymetric (it hides its progress bar
+        above 2), default 3. For method="jax": 1 prints the tuning.
+    method : {"jax", "numpy"}, optional
+    walkers : int, optional
+        Chains run together by the JAX sampler. Defaults to 4096.
     **mc
         step_size, burn_in, thin for the chain.
 
@@ -196,11 +205,22 @@ def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, **mc) -> tupl
     omega : (n_p,) complex128
     pullbacks : (n_p, dim, ncoords) complex128
     """
-    from cymetric.pointgen.pointgen_mc import ToricPointGeneratorMC
+    if method == "jax":
+        import jax
+        from . import toric_mc
+        x64 = jax.config.jax_enable_x64
+        try:
+            jax.config.update("jax_enable_x64", True)
+            z = toric_mc.sample(cyd, n_p, seed=seed, walkers=walkers, verbose=(1 if verbose == 1 else 0), **mc)
+        finally:
+            jax.config.update("jax_enable_x64", x64)
+        z = normalize(cyd, z)
+    else:
+        from cymetric.pointgen.pointgen_mc import ToricPointGeneratorMC
 
-    pg = ToricPointGeneratorMC(toric_data(cyd), np.asarray(cyd.kahler, dtype=float),
-                               seed=seed, verbose=verbose, **mc)
-    z  = normalize(cyd, pg.generate_points(n_p))
+        pg = ToricPointGeneratorMC(toric_data(cyd), np.asarray(cyd.kahler, dtype=float),
+                                   seed=seed, verbose=verbose, **mc)
+        z  = normalize(cyd, pg.generate_points(n_p))
     dim_amb = cyd.ncoords - np.asarray(cyd.glsm).shape[0]
     rank    = fs_rank(cyd, z[:min(200, len(z))])
     if rank < dim_amb:
