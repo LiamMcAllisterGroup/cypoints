@@ -125,7 +125,19 @@ def _weight_parts(cyd: CYData, z: np.ndarray, assigns: list) -> tuple:
 # ============================
 def dqdz(cyd: CYData, z: ArrayLike) -> np.ndarray:
     """
-    Return dQ/dz_a at each point, shape (n_p, ncoords).
+    Return dQ/dz_a at each point.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data; its exponents and coefficients define Q.
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points.
+
+    Returns
+    -------
+    out : ndarray of shape (n_p, ncoords), complex
+        The Wirtinger gradient of Q.
     """
     return poly.gradient(z, cyd.exponents, cyd.coefficients)
 
@@ -135,7 +147,20 @@ def eliminated_coord(cyd: CYData, z: ArrayLike,
     """
     Index of the coordinate to solve Q = 0 for: the largest |dQ/dz| among the
     coordinates not already scaled to 1. Largest keeps the division stable.
-    Pass `dQ` to reuse an existing dQ/dz.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data.
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points on the CY, rescaled so one coordinate per factor is 1.
+    dQ : ArrayLike of shape (n_p, ncoords) | None, optional
+        An existing dQ/dz to reuse. None recomputes it. Defaults to None.
+
+    Returns
+    -------
+    out : ndarray of shape (n_p,), int
+        The eliminated coordinate of each point.
     """
     z = np.asarray(z, dtype=np.complex128)
     d = dqdz(cyd, z) if dQ is None else np.asarray(dQ)
@@ -147,6 +172,23 @@ def omega(cyd: CYData, z: ArrayLike, j_elim: ArrayLike | None = None,
     """
     Holomorphic volume form by the Poincare residue, Omega = 1/(dQ/dz_j) with
     j the eliminated coordinate.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data.
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points on the CY.
+    j_elim : ArrayLike of shape (n_p,) | None, optional
+        The eliminated coordinates, from `eliminated_coord`. None recomputes
+        them. Defaults to None.
+    dQ : ArrayLike of shape (n_p, ncoords) | None, optional
+        An existing dQ/dz to reuse. None recomputes it. Defaults to None.
+
+    Returns
+    -------
+    out : ndarray of shape (n_p,), complex
+        Omega at each point.
     """
     z      = np.asarray(z, dtype=np.complex128)
     dQ     = dqdz(cyd, z) if dQ is None else np.asarray(dQ)
@@ -158,12 +200,27 @@ def omega(cyd: CYData, z: ArrayLike, j_elim: ArrayLike | None = None,
 def pullbacks(cyd: CYData, z: ArrayLike, j_elim: ArrayLike | None = None,
               dQ: ArrayLike | None = None) -> np.ndarray:
     """
-    Pullback J^i_a = dz_i/dx_a from the ambient to the CY, shape
-    (n_p, dim, ncoords).
+    Pullback J^i_a = dz_i/dx_a from the ambient to the CY.
 
     The coordinates left free by the patch, less the eliminated one, are the
     CY coordinates and pull back as the identity. The eliminated one follows
     from dQ = 0, giving dz_j/dx_a = -(dQ/dx_a)/(dQ/dz_j).
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data.
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points on the CY, rescaled so one coordinate per factor is 1.
+    j_elim : ArrayLike of shape (n_p,) | None, optional
+        The eliminated coordinates. None recomputes them. Defaults to None.
+    dQ : ArrayLike of shape (n_p, ncoords) | None, optional
+        An existing dQ/dz to reuse. None recomputes it. Defaults to None.
+
+    Returns
+    -------
+    out : ndarray of shape (n_p, dim, ncoords), complex
+        The pullback at each point.
     """
     z      = np.asarray(z, dtype=np.complex128)
     n_p    = len(z)
@@ -193,10 +250,21 @@ def pullbacks(cyd: CYData, z: ArrayLike, j_elim: ArrayLike | None = None,
 # ========================
 def fs_generators(cyd: CYData, z: ArrayLike) -> list:
     """
-    The Fubini-Study factor ddbar log kappa_i of each Kahler-cone generator,
-    one (n_p, ncoords, ncoords) array apiece. Computing these once and
-    combining them is much cheaper than rebuilding the section monomials for
-    every Kahler parameter.
+    The Fubini-Study factor ddbar log kappa_i of each Kahler-cone generator.
+    Computing these once and combining them is much cheaper than rebuilding
+    the section monomials for every Kahler parameter.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data; `cyd.sections` gives the section monomials.
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points.
+
+    Returns
+    -------
+    out : list of ndarray
+        One (n_p, ncoords, ncoords) hermitian array per generator.
     """
     z   = np.asarray(z, dtype=np.complex128)
     out = []
@@ -225,6 +293,20 @@ def fs_metric(cyd: CYData, z: ArrayLike, t: ArrayLike) -> np.ndarray:
     to one projective space per generator, and the ambient need not factorize
     into projective spaces at all. The 1/pi matches cymetric, so that the
     weights agree with it outright rather than up to a convention.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data.
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points.
+    t : ArrayLike of shape (h11,)
+        Kahler parameters, one per generator.
+
+    Returns
+    -------
+    out : ndarray of shape (n_p, ncoords, ncoords), complex
+        The ambient metric at each point.
     """
     return sum(ti * g for ti, g in zip(np.asarray(t), fs_generators(cyd, z)))
 
@@ -234,6 +316,17 @@ def assignments(cyd: CYData) -> list:
     Every way of spreading the sampling parameters over the generators, so
     that the directions left over -- the ones that set the induced measure --
     number exactly `dim`. Each generator can absorb at most its own dimension.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data.
+
+    Returns
+    -------
+    out : list of ndarray
+        One integer vector per assignment: the number of sampling parameters
+        each generator carries.
     """
     caps    = [len(S) - 1 for S in cyd.sections]
     n_param = sum(caps) - cyd.dim

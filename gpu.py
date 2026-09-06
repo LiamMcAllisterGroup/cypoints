@@ -106,6 +106,21 @@ def generate_points(cyd: CYData,
 def weights(cyd: CYData, z: ArrayLike, normalize: bool = True) -> jnp.ndarray:
     """
     Integration weights on the GPU; see `measure.weights` for the definition.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data.
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points on the CY.
+    normalize : bool, optional
+        Rescale so the flat measure integrates the Fubini-Study volume to
+        `cyd.vol_j_norm`, as `measure.weights`. Defaults to True.
+
+    Returns
+    -------
+    out : jnp.ndarray of shape (n_p,), float64
+        The weight at each point, on the device.
     """
     z = jnp.asarray(z, dtype=jnp.complex128)
     return _weigher(cyd, z.shape, normalize)(z)[0]
@@ -115,6 +130,15 @@ def measure_all(cyd: CYData, z: ArrayLike, normalize: bool = True) -> tuple:
     """
     Weights, holomorphic volume form and pullbacks in one program: the weights
     need Omega and the pullbacks anyway, so this costs the same as `weights`.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data.
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points on the CY.
+    normalize : bool, optional
+        As `weights`. Defaults to True.
 
     Returns
     -------

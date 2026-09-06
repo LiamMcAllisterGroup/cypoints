@@ -75,7 +75,7 @@ def generate_points(cyd: CYData,
         Seed for the sphere sampling. Defaults to 0.
     acc : float, optional
         Roots whose relative backward error exceeds this are dropped.
-        Defaults to 1e-10.
+        Defaults to 1e-8.
 
     Returns
     -------
@@ -158,6 +158,21 @@ def projective_factors(glsm: ArrayLike) -> list:
 
     Only valid when the ambient is a product of projective spaces, i.e. every
     coordinate has charge 1 under exactly one row and 0 under the rest.
+
+    Parameters
+    ----------
+    glsm : ArrayLike of shape (h11, ncoords), int
+        The GLSM charge matrix.
+
+    Returns
+    -------
+    out : list of ndarray
+        The coordinate indices of each factor, in GLSM-row order.
+
+    Raises
+    ------
+    NotImplementedError
+        If the ambient is not a product of projective spaces.
     """
     Q = np.asarray(glsm)
     if not (np.isin(Q, (0, 1)).all() and (Q.sum(axis=0) == 1).all()):
@@ -170,6 +185,18 @@ def projective_factors(glsm: ArrayLike) -> list:
 def rescale(z: ArrayLike, factors: list) -> np.ndarray:
     """
     Scale each factor so its largest-modulus coordinate is 1 + 0j.
+
+    Parameters
+    ----------
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points in the ambient.
+    factors : list of ArrayLike
+        The coordinate indices of each factor, from `projective_factors`.
+
+    Returns
+    -------
+    out : ndarray of shape (n_p, ncoords), complex
+        A rescaled copy.
     """
     z = np.array(z, dtype=np.complex128)
     for f in factors:

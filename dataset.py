@@ -50,6 +50,16 @@ def coord_permutation(cyd: CYData) -> np.ndarray:
     instead slice coordinates as consecutive blocks per factor, so anything
     handed to them must be reordered first. Skipping this does not raise: the
     metric silently comes out non-Hermitian.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data; its ambient must be a product of projective spaces.
+
+    Returns
+    -------
+    out : ndarray of shape (ncoords,), int
+        Permutation of the coordinate indices, factor by factor.
     """
     return np.concatenate(projective_factors(cyd.glsm))
 
@@ -205,6 +215,22 @@ def compute_kappa(cyd: CYData, z: ArrayLike, w: ArrayLike | None = None,
     Both volumes are weighted means over the sample: vol_k integrates the
     Fubini-Study volume against the flat measure w/|Omega|^2, and vol_cy is
     just the mean weight.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data; `cyd.kahler` sets the Fubini-Study metric.
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points on the CY.
+    w : ArrayLike of shape (n_p,) | None, optional
+        Their weights; None recomputes them. Defaults to None.
+    om2 : ArrayLike of shape (n_p,) | None, optional
+        |Omega|^2 at the points; None recomputes it. Defaults to None.
+
+    Returns
+    -------
+    out : float
+        kappa.
     """
     z = np.asarray(z, dtype=np.complex128)
     if w is None:
@@ -223,9 +249,22 @@ def compute_kappa(cyd: CYData, z: ArrayLike, w: ArrayLike | None = None,
 # =======
 def dqdz_basis(cyd: CYData) -> tuple:
     """
-    Monomials of dQ/dz_a: exponents (ncoords, n_mon, ncoords) and prefactors
-    (ncoords, n_mon). Terms without z_a carry a zero prefactor, so no padding
-    is needed -- every row is the same length.
+    Monomials of dQ/dz_a, in the layout cymetric's basis pickle expects.
+
+    Terms without z_a carry a zero prefactor, so no padding is needed -- every
+    row is the same length.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data.
+
+    Returns
+    -------
+    exps : ndarray of shape (ncoords, n_mon, ncoords), int
+        Exponents of the monomials of dQ/dz_a, one row of monomials per a.
+    facs : ndarray of shape (ncoords, n_mon), complex
+        Their prefactors: coefficient times the lowered exponent.
     """
     exps = np.asarray(cyd.exponents)
     cfs  = np.asarray(cyd.coefficients)

@@ -34,10 +34,24 @@ if TYPE_CHECKING:
 
 def power_table(z: ArrayLike, k_max: int, xp=np) -> ArrayLike:
     """
-    Table of z_a^k for k = 0..k_max, shape (n_p, ncoords, k_max + 1).
+    Table of z_a^k for k = 0..k_max.
 
     Repeated multiplication, because complex `**` with an array exponent goes
     through cpow and is an order of magnitude slower.
+
+    Parameters
+    ----------
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points.
+    k_max : int
+        Highest power needed.
+    xp : module, optional
+        Array namespace, `numpy` or `jax.numpy`. Defaults to numpy.
+
+    Returns
+    -------
+    out : ArrayLike of shape (n_p, ncoords, k_max + 1)
+        The powers.
     """
     z   = xp.asarray(z)
     out = [xp.ones_like(z)]
@@ -88,6 +102,24 @@ def evaluate(z: ArrayLike, exps: ArrayLike, coeffs: ArrayLike,
              table=None, xp=np) -> ArrayLike:
     """
     Evaluate the polynomial sum_m coeffs_m * z^exps_m at each point.
+
+    Parameters
+    ----------
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points.
+    exps : ArrayLike of shape (n_mon, ncoords), int
+        Exponent vectors.
+    coeffs : ArrayLike of shape (n_mon,), complex
+        Coefficients.
+    table : ArrayLike | None, optional
+        A `power_table` to reuse. None builds one. Defaults to None.
+    xp : module, optional
+        Array namespace, `numpy` or `jax.numpy`. Defaults to numpy.
+
+    Returns
+    -------
+    out : ArrayLike of shape (n_p,), complex
+        The polynomial values.
     """
     return monomials(z, exps, table, xp) @ xp.asarray(coeffs)
 
@@ -95,13 +127,31 @@ def evaluate(z: ArrayLike, exps: ArrayLike, coeffs: ArrayLike,
 def gradient(z: ArrayLike, exps: ArrayLike, coeffs: ArrayLike,
              table=None, xp=np) -> ArrayLike:
     """
-    Evaluate dQ/dz_a at each point, shape (n_p, ncoords).
+    Evaluate dQ/dz_a at each point.
 
     Since d(z^e)/dz_a = e_a z^e / z_a, one monomial pass plus a matmul gives
     every column at once -- far cheaper than lowering the exponents once per
     coordinate. Terms without z_a carry a zero prefactor, so only a genuinely
     vanishing z_a is a problem; those columns fall back to the exact lowered
-    form.
+    form (numpy path only; sampled points never hit an exact zero).
+
+    Parameters
+    ----------
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points.
+    exps : ArrayLike of shape (n_mon, ncoords), int
+        Exponent vectors.
+    coeffs : ArrayLike of shape (n_mon,), complex
+        Coefficients.
+    table : ArrayLike | None, optional
+        A `power_table` to reuse. None builds one. Defaults to None.
+    xp : module, optional
+        Array namespace, `numpy` or `jax.numpy`. Defaults to numpy.
+
+    Returns
+    -------
+    out : ArrayLike of shape (n_p, ncoords), complex
+        The gradient.
     """
     exps   = np.asarray(exps)
     coeffs = xp.asarray(coeffs)
