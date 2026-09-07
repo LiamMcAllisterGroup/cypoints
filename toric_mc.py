@@ -99,6 +99,10 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
 
     PC    = jnp.asarray([pc for pc, _ in patches])                      # (n_patch, h11)
     QINV  = jnp.asarray(np.stack([Qi for _, Qi in patches]), dtype=jnp.float64)   # (n_patch, h11, h11)
+    # |det Q[:, pc]|: the order of the residual group of the chart, and the constant of the residue
+    # formula there (measure.chart_factor); pivot masks to recover a state's chart
+    LOGK  = jnp.asarray([math.log(abs(np.linalg.det(np.asarray(cyd.glsm, float)[:, list(pc)]))) for pc, _ in patches])
+    PIVM  = jnp.asarray(np.stack([np.isin(np.arange(N), pc) for pc, _ in patches]))            # (n_patch, N) bool
 
     def choose_patch(z):
         """Per walker the admissible patch with the smallest max |z| after rescaling
@@ -233,10 +237,13 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
             acc = ok & (log_u < jnp.log(jnp.maximum(pi_new, 1e-300)) - jnp.log(jnp.maximum(pi_old, 1e-300)))
             return jnp.where(acc[:, None], zp, z), acc
         n  = jnp.conj(jnp.where(piv_c, 0.0, dq))            # the slice normal: the walk stays in the chart
+        i_c = jnp.argmax((PIVM[None, :, :] == piv_c[:, None, :]).all(axis=2), axis=1)   # the state's chart
         y  = project_along(z + step_size * v, n, newton_iters)
         res = residual(y)
         qy, dqy = q_dq(y)
-        log_fwd = -0.5 * jnp.sum(jnp.abs(v) ** 2, axis=1) + jnp.log(surface_jacobian(y, dqy, piv_c))
+        # kernel density w.r.t. |Omega ^ Omega-bar|: exp(-|v|^2) S_c(y) / k_c^2, k_c = |det Q[:, pivots]|
+        # (|Omega|^2 = k_c^2 / |dQ_j|^2 in an orbifold chart, measure.chart_factor)
+        log_fwd = -0.5 * jnp.sum(jnp.abs(v) ** 2, axis=1) + jnp.log(surface_jacobian(y, dqy, piv_c)) - 2.0 * LOGK[i_c]
         # reverse move, in y's canonical chart
         i  = choose_patch(y)
         yc, piv_cp = rescale_to(y, i)
@@ -248,7 +255,7 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
         xr  = project_along(yc + vr, nyc, newton_iters)
         rev_ok = jnp.max(jnp.abs(xr - xc), axis=1) < 1e-8 * jnp.maximum(1.0, jnp.max(jnp.abs(xc), axis=1))
         qxc, dqxc = q_dq(xc)
-        log_rev = -0.5 * jnp.sum(jnp.abs(vr) ** 2, axis=1) / step_size ** 2 + jnp.log(surface_jacobian(xc, dqxc, piv_cp))
+        log_rev = -0.5 * jnp.sum(jnp.abs(vr) ** 2, axis=1) / step_size ** 2 + jnp.log(surface_jacobian(xc, dqxc, piv_cp)) - 2.0 * LOGK[i]
         log_r = log_rev - log_fwd
         ok  = (res < 1e-9) & rev_ok & jnp.isfinite(log_r) & jnp.all(jnp.isfinite(yc), axis=1)
         acc = ok & (log_u < log_r)

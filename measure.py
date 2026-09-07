@@ -194,7 +194,67 @@ def omega(cyd: CYData, z: ArrayLike, j_elim: ArrayLike | None = None,
     dQ     = dqdz(cyd, z) if dQ is None else np.asarray(dQ)
     j_elim = (eliminated_coord(cyd, z, dQ) if j_elim is None
               else np.asarray(j_elim))
-    return 1.0 / dQ[np.arange(len(z)), j_elim]
+    return chart_factor(cyd, z) / dQ[np.arange(len(z)), j_elim]
+
+
+def chart_factor(cyd: CYData, z: ArrayLike) -> np.ndarray:
+    """
+    |det Q[:, pivots]| for the chart each point is held in: the constant by
+    which the residue formula Omega = dz_free / (dQ/dz_j) must be multiplied
+    there.
+
+    The invariant volume form is mu = i_{E_1} ... i_{E_h11} dz_1 ^ ... ^ dz_N
+    with E_a = sum_rho Q_{a rho} z_rho d/dz_rho the Euler fields; mu / Q is
+    a meromorphic form on the toric variety whose residue on X is Omega. On
+    the slice z_pivots = 1, mu = det Q[:, pivots] prod_{non-pivot} dz_rho, so
+    charts with |det| = k > 1 (orbifold charts, where the slice is a k-fold
+    cover of the affine patch) carry the factor k. It is 1 on every chart of
+    a product of projective spaces and of a smooth toric variety, and 2-4 on
+    some charts of most Kreuzer-Skarke fans, where omitting it (as cymetric
+    does) biases |Omega|^2 by k^2 there: 30-50% volume errors on the
+    polytopes of benchmarks/h11_scan.
+
+    Parameters
+    ----------
+    cyd : CYData
+        Needs `cyd.glsm`; points are taken to be in the chart of their
+        coordinates equal to 1 (as `toric.normalize` leaves them).
+    z : ArrayLike of shape (n_p, ncoords), complex
+
+    Returns
+    -------
+    out : ndarray of shape (n_p,), float
+    """
+    z = np.asarray(z)
+    if getattr(cyd, "glsm", None) is None or not _has_orbifold_charts(cyd):
+        return np.ones(len(z))
+    Q   = np.asarray(cyd.glsm, dtype=float)
+    piv = np.isclose(z, 1.0)
+    out = np.ones(len(z))
+    for pat in np.unique(piv, axis=0):
+        pc = np.flatnonzero(pat)
+        if len(pc) != Q.shape[0]:
+            continue                                   # not a chart representative: leave 1
+        sel = (piv == pat).all(axis=1)
+        out[sel] = abs(np.linalg.det(Q[:, pc]))
+    return out
+
+
+def _has_orbifold_charts(cyd: CYData) -> bool:
+    """Cached: does any admissible patch have |det Q[:, pivots]| != 1?"""
+    flag = getattr(cyd, "_orbifold_charts", None)
+    if flag is None:
+        Q = np.asarray(cyd.glsm, dtype=float); flag = False
+        for mask in (np.asarray(cyd.patch_masks) if getattr(cyd, "patch_masks", None) is not None else []):
+            pc = np.flatnonzero(mask)
+            if len(pc) == Q.shape[0] and not np.isclose(abs(np.linalg.det(Q[:, pc])), 1.0):
+                flag = True
+                break
+        try:
+            object.__setattr__(cyd, "_orbifold_charts", flag)
+        except Exception:
+            pass
+    return bool(flag)
 
 
 def pullbacks(cyd: CYData, z: ArrayLike, j_elim: ArrayLike | None = None,
