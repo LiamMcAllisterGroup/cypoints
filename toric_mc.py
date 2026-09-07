@@ -59,7 +59,7 @@ def _patches(cyd: CYData) -> tuple:
 
 
 def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = True,
-                   mixed: bool = True, polish_iters: int = 1):
+                   mixed: bool = True, polish_iters: int = 1, exact: bool = True):
     """
     The jitted pieces for one geometry: Q and dQ/dz, patch normalisation,
     |Omega|^2, one Metropolis-Hastings step, and the batched Newton projection
@@ -71,7 +71,16 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
         half the step). The step accepts only proposals whose relative
         residual is below 1e-9 afterwards.
     normalize_steps : normalise to a patch after every step (cymetric's
-        chain does); the density |Omega|^2 is evaluated in that patch.
+        chain does; the exact move needs it and ignores False).
+    exact : True (default) is the manifold Metropolis-Hastings move of Zappa,
+        Holmes-Cerfon and Goodman (2018) with the chart Jacobians, which has
+        |Omega ^ Omega-bar| as its exact stationary measure. False is
+        cymetric's move: tangent Gaussian, moving-normal Newton, accept on
+        |Omega|^2 alone. That one is biased by an O(1) factor: its stationary
+        measure is |Omega ^ Omega-bar| times det(J J^dagger), the ratio of the
+        chart's Hermitian surface measure to the |Omega|^2 coordinate measure
+        (measured on the tetraquadric against the exact line sampler, and 20-40%
+        volume errors on an h11 = 3 polytope where charts change often).
     """
     E   = np.asarray(cyd.exponents)
     c128 = jnp.asarray(cyd.coefficients, dtype=jnp.complex128)
@@ -81,6 +90,7 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
     Q   = jnp.asarray(cyd.glsm, dtype=jnp.float64)
     patches = _patches(cyd)
     N   = cyd.ncoords
+    DIM = int(cyd.dim)
 
     def q_dq(z):                                              # (W, N) -> (W,), (W, N); dtype of z
         mons = poly.monomials(z, E, None, jnp)                # one monomial pass serves Q and dQ
@@ -124,7 +134,7 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
         free = ~jnp.isclose(z, 1.0 + 0j)
         j    = jnp.argmax(jnp.where(free, jnp.abs(dq), -1.0), axis=1)
         d    = jnp.take_along_axis(dq, j[:, None], axis=1)[:, 0]
-        return 1.0 / jnp.abs(d) ** 2
+        return 1.0 / jnp.abs(d) ** 2, j
 
     def newton(z, iters):
         def body(_, zc):
@@ -146,23 +156,103 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
             z = newton(z, iters)
         return z, residual(z)
 
+    def project_along(z0, n, iters):
+        """Solve Q(z0 + lam n) = 0 for the complex scalar lam by Newton from lam = 0: the
+        projection along the fixed direction n, a deterministic map whose inverse the
+        reverse move can check. Mixed precision as `project`."""
+        def body(_, lam):
+            zz = z0 + lam[:, None] * n
+            q, dq = q_dq(zz)
+            return lam - q / jnp.sum(dq * n, axis=1)
+        def body64(_, lam):
+            zz = z0_64 + lam[:, None] * n_64
+            q, dq = q_dq(zz)
+            return lam - q / jnp.sum(dq * n_64, axis=1)
+        lam = jnp.zeros(z0.shape[0], dtype=jnp.complex128)
+        if mixed and iters > polish_iters:
+            z0_64, n_64 = z0.astype(jnp.complex64), n.astype(jnp.complex64)
+            lam = jax.lax.fori_loop(0, iters - polish_iters, body64, lam.astype(jnp.complex64)).astype(jnp.complex128)
+            lam = jax.lax.fori_loop(0, polish_iters, body, lam)
+        else:
+            lam = jax.lax.fori_loop(0, iters, body, lam)
+        return z0 + lam[:, None] * n
+
+    def surface_jacobian(z, dq, pivots):
+        """S_c(z) = sum over the chart's non-pivot coordinates of |dQ/dz_a|^2: the density of the
+        chart's Hermitian surface measure on X relative to |Omega ^ Omega-bar| (= |Omega|^2 det J J^dagger)."""
+        return jnp.sum(jnp.where(pivots, 0.0, jnp.abs(dq) ** 2), axis=1)
+
+    def rescale_to(z, i):
+        """The C* rescaling of z into patch i (pivots exactly 1)."""
+        pc   = PC[i]
+        zp   = jnp.take_along_axis(z, pc, axis=1)
+        mu   = jnp.einsum("wa,wab->wb", -jnp.log(zp), QINV[i])
+        sc   = jnp.exp(mu @ Q) * z
+        piv  = (jnp.arange(N)[None, None, :] == pc[:, :, None]).any(axis=1)
+        return jnp.where(piv, 1.0 + 0j, sc), piv
+
+    def tangent(dq, w, pivots):
+        """Component of w tangent to X within the chart's slice {z_pivots = 1}: pivot entries
+        zeroed, then the Hermitian projection orthogonal to the slice gradient."""
+        dq = jnp.where(pivots, 0.0, dq)
+        w  = jnp.where(pivots, 0.0, w)
+        return w - jnp.conj(dq) * (jnp.sum(dq * w, axis=1) / jnp.sum(jnp.abs(dq) ** 2, axis=1))[:, None]
+
     @jax.jit
     def step(z, key, step_size):
-        """One Metropolis-Hastings step for all walkers; returns (z, accepted)."""
+        """One Metropolis-Hastings step for all walkers; returns (z, accepted). States are
+        canonical-chart representatives (toric.normalize's patch choice).
+
+        Exact move (Zappa, Holmes-Cerfon, Goodman 2018, "Monte Carlo on manifolds"), in the
+        walker's chart c: v = tangent standard complex Gaussian at x, y = projection of
+        x + s v along the normal n_x = conj(dQ(x)); then y is normalised to its own canonical
+        chart c' and the reverse move is built there: x_c' = x rescaled into chart c',
+        v' = tangent part of (x_c' - y_c') at y_c', and the reverse projection along n_y from
+        y_c' + v' must return x_c' (else reject). With the target |Omega ^ Omega-bar| itself
+        as reference measure, the forward kernel density is exp(-|v|^2) S_c(y) and the reverse
+        exp(-|v'|^2/s^2) S_c'(x_c'), where S_c = sum_{a not a pivot of c} |dQ/dz_a|^2 is the
+        Jacobian of the chart's Hermitian surface measure (in which the tangent Gaussian is
+        symmetric) relative to |Omega ^ Omega-bar|; accept with min(1, reverse / forward).
+        Both densities are finite-step exact, so the chain is unbiased at any step size."""
         k1, k2, k3 = jax.random.split(key, 3)
-        q, dq  = q_dq(z)
-        pi_old = omega2(z, dq)
-        w   = jax.random.normal(k1, z.shape) + 1j * jax.random.normal(k2, z.shape)
-        w   = w - jnp.conj(dq) * (jnp.sum(dq * w, axis=1) / jnp.sum(jnp.abs(dq) ** 2, axis=1))[:, None]
-        zp, res = project(z + step_size * w, newton_iters)
-        if normalize_steps:
-            zp = normalize(zp)                                 # exact rescaling: stays on Q = 0
-        _, dqp = q_dq(zp)
-        pi_new = omega2(zp, dqp)
-        ok  = (res < 1e-9) & jnp.isfinite(pi_new) & (pi_new > 0)
-        log_u = jnp.log(jnp.maximum(jax.random.uniform(k3, (z.shape[0],)), 1e-300))
-        acc = ok & (log_u < jnp.log(jnp.maximum(pi_new, 1e-300)) - jnp.log(jnp.maximum(pi_old, 1e-300)))
-        return jnp.where(acc[:, None], zp, z), acc
+        W = z.shape[0]
+        w  = jax.random.normal(k1, z.shape) + 1j * jax.random.normal(k2, z.shape)   # CN(0, 2 I): |v|^2 uses 1/2
+        log_u = jnp.log(jnp.maximum(jax.random.uniform(k3, (W,)), 1e-300))
+        q, dq = q_dq(z)
+        piv_c = jnp.isclose(z, 1.0 + 0j)
+        v  = tangent(dq, w, piv_c)
+        if not exact:
+            v  = tangent(dq, w, jnp.zeros_like(piv_c))          # cymetric: the ambient tangent Gaussian
+            pi_old, _ = omega2(z, dq)
+            zp, res = project(z + step_size * v, newton_iters)
+            if normalize_steps:
+                zp = normalize(zp)
+            _, dqp = q_dq(zp)
+            pi_new, _ = omega2(zp, dqp)
+            ok  = (res < 1e-9) & jnp.isfinite(pi_new) & (pi_new > 0)
+            acc = ok & (log_u < jnp.log(jnp.maximum(pi_new, 1e-300)) - jnp.log(jnp.maximum(pi_old, 1e-300)))
+            return jnp.where(acc[:, None], zp, z), acc
+        n  = jnp.conj(jnp.where(piv_c, 0.0, dq))            # the slice normal: the walk stays in the chart
+        y  = project_along(z + step_size * v, n, newton_iters)
+        res = residual(y)
+        qy, dqy = q_dq(y)
+        log_fwd = -0.5 * jnp.sum(jnp.abs(v) ** 2, axis=1) + jnp.log(surface_jacobian(y, dqy, piv_c))
+        # reverse move, in y's canonical chart
+        i  = choose_patch(y)
+        yc, piv_cp = rescale_to(y, i)
+        xc, _      = rescale_to(z, i)
+        qyc, dqyc = q_dq(yc)
+        nyc = jnp.conj(jnp.where(piv_cp, 0.0, dqyc))
+        d   = xc - yc
+        vr  = tangent(dqyc, d, piv_cp)
+        xr  = project_along(yc + vr, nyc, newton_iters)
+        rev_ok = jnp.max(jnp.abs(xr - xc), axis=1) < 1e-8 * jnp.maximum(1.0, jnp.max(jnp.abs(xc), axis=1))
+        qxc, dqxc = q_dq(xc)
+        log_rev = -0.5 * jnp.sum(jnp.abs(vr) ** 2, axis=1) / step_size ** 2 + jnp.log(surface_jacobian(xc, dqxc, piv_cp))
+        log_r = log_rev - log_fwd
+        ok  = (res < 1e-9) & rev_ok & jnp.isfinite(log_r) & jnp.all(jnp.isfinite(yc), axis=1)
+        acc = ok & (log_u < log_r)
+        return jnp.where(acc[:, None], yc, z), acc
 
     @functools.partial(jax.jit, static_argnums=1)
     def initial(key, n):
@@ -200,10 +290,10 @@ class Sampler:
 
     def __init__(self, cyd: CYData, walkers: int = 8192, seed: int = 0, step_size: float | None = None,
                  thin: int | None = None, burn_in: int | None = None, target_rate: float = 0.65,
-                 verbose: int = 0):
+                 verbose: int = 0, **programs):
         if not jax.config.jax_enable_x64:
             raise RuntimeError("toric_mc needs jax_enable_x64 (the Newton polish is float64)")
-        self.step, self.initial, _ = _make_programs(cyd)
+        self.step, self.initial, _ = _make_programs(cyd, **programs)
         self.key = jax.random.PRNGKey(seed)
         z, res = self.initial(self.key, walkers)
         bad = np.asarray(res) > 1e-9
@@ -257,7 +347,7 @@ class Sampler:
 
 def sample(cyd: CYData, n_p: int, seed: int = 0, walkers: int = 8192, step_size: float | None = None,
            thin: int | None = None, burn_in: int | None = None, target_rate: float = 0.65,
-           verbose: int = 0) -> np.ndarray:
+           verbose: int = 0, **programs) -> np.ndarray:
     """
     n_p points on the toric hypersurface distributed as |Omega|^2, from
     `walkers` independent Metropolis-Hastings chains stepped together
@@ -275,7 +365,7 @@ def sample(cyd: CYData, n_p: int, seed: int = 0, walkers: int = 8192, step_size:
     -------
     out : ndarray of shape (n_p, ncoords), complex128, GLSM-normalised
     """
-    return Sampler(cyd, walkers, seed, step_size, thin, burn_in, target_rate, verbose).draw(n_p)
+    return Sampler(cyd, walkers, seed, step_size, thin, burn_in, target_rate, verbose, **programs).draw(n_p)
 
 
 def _iac(series: np.ndarray, max_lag: int | None = None) -> int:

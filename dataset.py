@@ -31,12 +31,13 @@ import numpy as np
 
 # local imports
 from . import measure
+from .geometry import generator_coefficients
 from .pointgen import generate_points, projective_factors
 
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike
 
-    from .geometry import CYData
+    from .geometry import generator_coefficients, CYData
 
 
 # main entry points
@@ -196,7 +197,7 @@ def prepare_basis(cyd: CYData, dirname: str, kappa: float = 1.0) -> dict:
         "QB0":     np.asarray(cyd.exponents)[:, perm].astype(np.complex64),
         "QF0":     np.asarray(cyd.coefficients).astype(np.complex64),
         "AMBIENT": ambient,
-        "KMODULI": np.asarray(cyd.kahler),
+        "KMODULI": generator_coefficients(cyd),
         "NFOLD":   cyd.dim,
         "NHYPER":  1,
         "INTNUMS": np.asarray(cyd.kappa),
@@ -240,7 +241,7 @@ def compute_kappa(cyd: CYData, z: ArrayLike, w: ArrayLike | None = None,
         om2 = np.real(om * np.conj(om))
 
     pbs  = measure.pullbacks(cyd, z)
-    gfs  = measure.fs_metric(cyd, z, cyd.kahler)
+    gfs  = measure.fs_metric(cyd, z, generator_coefficients(cyd))
     dets = np.real(np.linalg.det(measure._pullback(pbs, gfs)))
     return float(np.mean(w * dets / om2) / np.mean(w))
 

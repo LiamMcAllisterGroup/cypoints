@@ -66,7 +66,7 @@ class CYData:
 
     # semi-arbitrary
     coefficients: np.ndarray  # (n_mon,) complex-structure moduli
-    kahler:       np.ndarray  # (h11,) Kahler moduli of J, in basis
+    kahler:       np.ndarray  # (h11,) the Kahler class J in the divisor basis; see generator_coefficients
 
 
 # main entry point
@@ -220,6 +220,47 @@ def product_cy(dims: ArrayLike, seed: int = 0) -> CYData:
                         + 1j * rng.standard_normal(n_mon)),
         kahler       = np.ones(F),
     )
+
+
+# Kahler-cone generator coefficients
+# ===================================
+def generator_coefficients(cyd: CYData) -> np.ndarray:
+    """
+    Coefficients t_alpha >= 0 of the Kahler class in the Kahler-cone
+    generators, kc_rays^T t = cyd.kahler.
+
+    The Fubini-Study form sum_alpha t_alpha omega_alpha, cymetric's kmoduli
+    and the toric samplers want these, not the components of J in the
+    divisor basis; the two coincide only when kc_rays is the identity (products
+    of projective spaces). Unique when the cone is simplicial; otherwise the
+    non-negative least-squares choice, which reproduces J exactly whenever J
+    is in the cone.
+
+    Parameters
+    ----------
+    cyd : CYData
+        The CY data.
+
+    Returns
+    -------
+    t : ndarray of shape (n_gen,)
+        The generator coefficients.
+
+    Raises
+    ------
+    ValueError
+        If J is not a non-negative combination of the generators.
+    """
+    R = np.asarray(cyd.kc_rays, dtype=np.float64)
+    k = np.asarray(cyd.kahler, dtype=np.float64)
+    if R.shape[0] == R.shape[1]:
+        t = np.linalg.solve(R.T, k)
+    else:
+        from scipy.optimize import nnls
+        t, _ = nnls(R.T, k)
+    if (t < -1e-9).any() or not np.allclose(R.T @ t, k, atol=1e-8 * max(1.0, np.abs(k).max())):
+        raise ValueError(f"the Kahler class {k} is not a non-negative combination of the cone generators (t = {t})")
+    return np.maximum(t, 0.0)
 
 
 # sections

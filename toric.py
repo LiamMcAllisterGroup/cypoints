@@ -35,12 +35,13 @@ import numpy as np
 
 # local imports
 from . import measure
+from .geometry import generator_coefficients
 from .dataset import compute_kappa, dqdz_basis
 
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike
 
-    from .geometry import CYData
+    from .geometry import generator_coefficients, CYData
 
 
 # cymetric's toric_data
@@ -144,6 +145,72 @@ def normalize(cyd: CYData, z: ArrayLike) -> np.ndarray:
     return out
 
 
+def basepoint_free(cyd: CYData) -> list:
+    """
+    Whether each Kahler-cone generator's sections have no common zero on the
+    ambient toric variety.
+
+    A divisor on a complete toric variety is base-point free iff for every
+    maximal cone sigma some section monomial involves none of sigma's
+    coordinates (it is then non-zero at sigma's fixed point). The section-norm
+    Fubini-Study form omega_a = ddbar log sum_k |s_k|^2 of such a generator is
+    a smooth form in the class D_a, so int_X omega_a omega_b omega_c equals
+    the intersection number for every base-point-free triple. cytools' Kahler
+    cone of the Calabi-Yau is larger than the toric one, and its extra
+    generators are nef on X only: their sections have common zeros on the
+    ambient (often meeting X), omega_a is singular there and the volume
+    identity fails for monomials containing it -- by 10-40% on the h11 = 3..8
+    polytopes of benchmarks/h11_scan, independent of the sampler.
+
+    Parameters
+    ----------
+    cyd : CYData
+        Needs `cyd.simps` (the fan's maximal cones).
+
+    Returns
+    -------
+    out : list of bool
+        One per generator.
+    """
+    simps = np.asarray(cyd.simps)
+    out = []
+    for S in cyd.sections:
+        S = np.asarray(S)
+        out.append(bool(all((S[:, list(sig)] == 0).all(axis=1).any() for sig in simps)))
+    return out
+
+
+def fs_generator_ranks(cyd: CYData, z: ArrayLike, tol: float = 1e-8) -> list:
+    """
+    Minimum rank over the points of each generator's pulled-back Fubini-Study
+    form ddbar log sum_k |s_k|^2.
+
+    The volume identity int (sum_a t_a omega_a)^3 = kappa(J, J, J) holds
+    monomial by monomial only for generators whose sections define an
+    immersion of X (rank dim); a rank-r generator has omega_a^(r+1) = 0
+    pointwise while D_a^(r+1) need not vanish, so every intersection number
+    involving it more than r times is missed by the ansatz. Products of
+    projective spaces (rank = the factor's dimension, and D_a^(r+1) = 0 too)
+    are the case where this is harmless.
+
+    Parameters
+    ----------
+    cyd : CYData
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Points on X (a few hundred suffice).
+    tol : float, optional
+        Rank tolerance. Defaults to 1e-8.
+
+    Returns
+    -------
+    ranks : list of int
+        One per Kahler-cone generator.
+    """
+    z   = np.asarray(z, dtype=np.complex128)
+    pbs = measure.pullbacks(cyd, z)
+    return [int(np.linalg.matrix_rank(measure._pullback(pbs, g), tol=tol).min()) for g in measure.fs_generators(cyd, z)]
+
+
 def fs_rank(cyd: CYData, z: ArrayLike, tol: float = 1e-8) -> int:
     """
     Rank of the ambient Fubini-Study form sum_alpha t_alpha omega_alpha at
@@ -162,7 +229,7 @@ def fs_rank(cyd: CYData, z: ArrayLike, tol: float = 1e-8) -> int:
     -------
     out : int
     """
-    g  = measure.fs_metric(cyd, np.asarray(z, dtype=np.complex128), np.asarray(cyd.kahler, dtype=float))
+    g  = measure.fs_metric(cyd, np.asarray(z, dtype=np.complex128), generator_coefficients(cyd))
     ev = np.abs(np.linalg.eigvalsh(g))
     return int((np.median(ev, axis=0) > tol * np.median(ev.max(axis=1))).sum())
 
@@ -172,17 +239,23 @@ def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, method: str =
     """
     Points, weights, Omega and pullbacks on a general toric hypersurface.
 
-    The Metropolis-Hastings chain samples |Omega|^2 directly (tangent-space
-    proposal, Newton projection, tuned step, burn-in and thinning), so the
-    weights are uniform, normalised so that the flat measure w/|Omega|^2
-    integrates the Fubini-Study volume form at `cyd.kahler` to kappa(J,J,J),
-    J = kc_rays^T t the class of the Kahler form in the divisor basis; the
-    assignment mixture of `measure.weights` is not needed.
+    The Metropolis-Hastings chain samples |Omega ^ Omega-bar| directly
+    (tangent-space proposal in the chart, projection onto Q = 0, tuned step,
+    burn-in and thinning), so the weights are uniform, normalised so that the
+    flat measure w/|Omega|^2 integrates the Fubini-Study volume form at
+    `cyd.kahler` to kappa(J, J, J), J = cyd.kahler the class of the Kahler form
+    in the divisor basis (the Fubini-Study coefficients are its
+    `generator_coefficients`); the assignment mixture of `measure.weights` is
+    not needed. That identity is exact only for generators whose sections
+    immerse X, see `fs_generator_ranks`.
 
     method="jax" (default) runs `walkers` chains together in one jitted program
-    per step (`toric_mc.sample`, ~10^4-10^5 points/s on a GPU, x64 switched on
-    for the call and restored); method="numpy" is cymetric's serial
-    `ToricPointGeneratorMC` (~10^2 points/s), kept as the reference.
+    per step (`toric_mc.sample`, ~10^5-10^6 points/s on a GPU, 10^4/s on a CPU,
+    x64 switched on for the call and restored) with the exact manifold move of
+    `toric_mc._make_programs`. method="numpy" is cymetric's serial
+    `ToricPointGeneratorMC` (~10^2 points/s); its move is biased by the
+    O(1) chart factor det(J J^dagger) (7% on E[1/det] on the tetraquadric, 2%
+    on the h11 = 2 volume identity), so it is kept for comparison only.
 
     Parameters
     ----------
@@ -218,7 +291,7 @@ def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, method: str =
     else:
         from cymetric.pointgen.pointgen_mc import ToricPointGeneratorMC
 
-        pg = ToricPointGeneratorMC(toric_data(cyd), np.asarray(cyd.kahler, dtype=float),
+        pg = ToricPointGeneratorMC(toric_data(cyd), generator_coefficients(cyd),
                                    seed=seed, verbose=verbose, **mc)
         z  = normalize(cyd, pg.generate_points(n_p))
     dim_amb = cyd.ncoords - np.asarray(cyd.glsm).shape[0]
@@ -231,13 +304,12 @@ def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, method: str =
     om  = measure.omega(cyd, z)
     om2 = np.real(om * np.conj(om))
     pbs = measure.pullbacks(cyd, z)
-    # cyd.kahler are the coefficients t of the Kahler-cone generators (what the
-    # Fubini-Study form and cymetric's generator take); the class of J in the
-    # divisor basis is kc_rays^T t, and the volume is kappa(J, J, J) (no 1/3!).
-    # On a product ambient kc_rays is the identity and the two agree.
-    t   = np.asarray(cyd.kahler, dtype=float)
-    J   = np.asarray(cyd.kc_rays, dtype=float).T @ t
-    det = np.real(np.linalg.det(measure._pullback(pbs, measure.fs_metric(cyd, z, t))))
+    # cyd.kahler is the class J of the Kahler form in the divisor basis; the
+    # Fubini-Study form is sum_alpha t_alpha omega_alpha with t the generator
+    # coefficients (generator_coefficients), and the volume is kappa(J, J, J)
+    # (no 1/3!). On a product ambient kc_rays is the identity and t = J.
+    J   = np.asarray(cyd.kahler, dtype=float)
+    det = np.real(np.linalg.det(measure._pullback(pbs, measure.fs_metric(cyd, z, generator_coefficients(cyd)))))
     vol = float(np.einsum("ijk,i,j,k->", np.asarray(cyd.kappa), J, J, J))
     w   = np.full(len(z), vol / np.mean(det / om2))
     return z, w, om, pbs
@@ -294,7 +366,7 @@ def prepare_basis(cyd: CYData, dirname: str, kappa: float = 1.0) -> dict:
         "QB0":        np.asarray(cyd.exponents).astype(np.complex64),
         "QF0":        np.asarray(cyd.coefficients).astype(np.complex64),
         "AMBIENT":    ambient,
-        "KMODULI":    np.asarray(cyd.kahler),
+        "KMODULI":    generator_coefficients(cyd),
         "NFOLD":      cyd.dim,
         "NHYPER":     1,
         "INTNUMS":    np.asarray(cyd.kappa),
