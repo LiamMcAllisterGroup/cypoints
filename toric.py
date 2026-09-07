@@ -174,6 +174,73 @@ def generator_intersection_numbers(cyd: CYData) -> np.ndarray:
     return np.einsum("ijk,ai,bj,ck->abc", K, R, R, R)
 
 
+def basepoint_free_multiples(cyd: CYData, max_m: int = 8, verbose: int = 0):
+    """
+    Replace every Kahler-cone generator whose sections have a common zero on
+    the toric variety by the smallest multiple m D that is base-point free,
+    and return the modified data together with the multipliers.
+
+    The trick is that scaling a generator's ray by m and its sections to those
+    of m D leaves everything downstream consistent: `generator_coefficients`
+    solves kc_rays^T t = cyd.kahler, so its coefficient becomes t/m, the
+    Fubini-Study form built from the new sections is (1/m) ddbar log sum |s(mD)|^2
+    once multiplied by that coefficient, and it represents D again. Intersection
+    numbers in the generator basis, KMODULI and the volume identity follow.
+
+    Why it matters: with base points on X the section-norm form is singular
+    there and represents only the moving part of the system, so the ansatz
+    metric is not in the class asked for. Measured on the h11 scan, polytopes
+    with every generator base-point free reach sigma 0.03-0.07 while those with
+    generators outside the chamber stall at 0.18-0.70.
+
+    Parameters
+    ----------
+    cyd : CYData
+        Needs `cyd.rays`, `cyd.simps` and `cyd.divisor_basis`.
+    max_m : int, optional
+        Largest multiple tried. Defaults to 8.
+    verbose : int, optional
+
+    Returns
+    -------
+    out : CYData
+        A copy with `kc_rays` and `sections` replaced (and `kahler` unchanged).
+    mult : list of int
+        The multiplier used per generator, 1 where none was needed.
+
+    Raises
+    ------
+    ValueError
+        If some generator is not base-point free up to `max_m`.
+    """
+    import copy
+
+    from .geometry import exps_sections
+
+    rays  = np.asarray(cyd.rays)
+    basis = np.asarray(cyd.divisor_basis)
+    R     = np.asarray(cyd.kc_rays)
+    simps = np.asarray(cyd.simps)
+    bpf   = basepoint_free(cyd)
+    secs, mult, newR = list(cyd.sections), [1] * R.shape[0], R.astype(np.int64).copy()
+    for a, ok in enumerate(bpf):
+        if ok:
+            continue
+        for m in range(2, max_m + 1):
+            S = exps_sections(rays, basis, [m * R[a]])[0]
+            if all((np.asarray(S)[:, list(sig)] == 0).all(axis=1).any() for sig in simps):
+                secs[a], mult[a], newR[a] = S, m, m * R[a]
+                if verbose:
+                    print(f"  generator {a}: base-point free at m = {m} ({len(S)} sections)", flush=True)
+                break
+        else:
+            raise ValueError(f"generator {a} is not base-point free up to m = {max_m}")
+    out = copy.copy(cyd)
+    out.sections = secs
+    out.kc_rays  = newR
+    return out, mult
+
+
 def basepoint_free(cyd: CYData) -> list:
     """
     Whether each Kahler-cone generator's sections have no common zero on the
@@ -266,6 +333,57 @@ def fs_rank(cyd: CYData, z: ArrayLike, tol: float = 1e-8) -> int:
     return int((np.median(ev, axis=0) > tol * np.median(ev.max(axis=1))).sum())
 
 
+def measure_all(cyd: CYData, z, device: str = "auto") -> tuple:
+    """
+    Omega, the pullbacks and the pulled-back Fubini-Study determinant at
+    `generator_coefficients(cyd)`, from `cypoints.toric_gpu` when a GPU is
+    present and from `cypoints.measure` otherwise.
+
+    The numpy path is the cost of a toric dataset: the Fubini-Study metric is
+    sum_alpha n_alpha x ncoords^2 work per point, and `prepare_dataset` used to
+    run it twice (once for the weights, once for kappa). On an h11 = 17 fan with
+    4374 sections that was 550 s for 20k points against 3 s here.
+
+    Parameters
+    ----------
+    cyd : CYData
+    z : ArrayLike of shape (n_p, ncoords), complex
+        Canonical chart representatives (`normalize`).
+    device : {"auto", "gpu", "cpu"}, optional
+        "auto" uses the GPU when JAX reports one. Defaults to "auto".
+
+    Returns
+    -------
+    om : ndarray of shape (n_p,), complex
+    pbs : ndarray of shape (n_p, dim, ncoords), complex
+    det : ndarray of shape (n_p,), float
+        det of the pulled-back Fubini-Study metric at the generator coefficients.
+    """
+    z = np.asarray(z, dtype=np.complex128)
+    if device == "auto":
+        import jax
+        device = "gpu" if any(d.platform == "gpu" for d in jax.devices()) else "cpu"
+    if device == "gpu":
+        import jax
+        from . import toric_gpu
+        x64 = jax.config.jax_enable_x64
+        try:
+            if not x64:
+                jax.config.update("jax_enable_x64", True)
+            import jax.numpy as jnp
+            om, pbs, G = toric_gpu.measure_all(cyd, z)
+            t   = jnp.asarray(generator_coefficients(cyd), dtype=G.dtype)
+            det = np.real(np.asarray(jnp.linalg.det(jnp.einsum("a,axij->xij", t, G))))
+            return np.asarray(om), np.asarray(pbs), det
+        finally:
+            if not x64:
+                jax.config.update("jax_enable_x64", x64)
+    om  = measure.omega(cyd, z)
+    pbs = measure.pullbacks(cyd, z)
+    det = np.real(np.linalg.det(measure._pullback(pbs, measure.fs_metric(cyd, z, generator_coefficients(cyd)))))
+    return om, pbs, det
+
+
 def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, method: str = "jax",
            walkers: int = 8192, **mc) -> tuple:
     """
@@ -333,15 +451,13 @@ def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, method: str =
             f"the Fubini-Study form built from the Kahler-cone generators' sections has rank "
             f"{rank} < {dim_amb} on this toric variety (the generators' joint map is not an "
             f"immersion); see cypoints.toric.fs_rank. The sampler is consistent only where it is.")
-    om  = measure.omega(cyd, z)
+    om, pbs, det = measure_all(cyd, z)
     om2 = np.real(om * np.conj(om))
-    pbs = measure.pullbacks(cyd, z)
     # cyd.kahler is the class J of the Kahler form in the divisor basis; the
     # Fubini-Study form is sum_alpha t_alpha omega_alpha with t the generator
     # coefficients (generator_coefficients), and the volume is kappa(J, J, J)
     # (no 1/3!). On a product ambient kc_rays is the identity and t = J.
     J   = np.asarray(cyd.kahler, dtype=float)
-    det = np.real(np.linalg.det(measure._pullback(pbs, measure.fs_metric(cyd, z, generator_coefficients(cyd)))))
     vol = float(np.einsum("ijk,i,j,k->", np.asarray(cyd.kappa), J, J, J))
     w   = np.full(len(z), vol / np.mean(det / om2))
     return z, w, om, pbs
@@ -366,7 +482,9 @@ def prepare_dataset(cyd: CYData, n_p: int, dirname: str, val_split: float = 0.1,
     order = np.random.default_rng(seed).permutation(len(z))         # the chain is ordered
     z, w, om, pbs = z[order], w[order], om[order], pbs[order]
     om2   = np.real(om * np.conj(om))
-    kappa = compute_kappa(cyd, z, w, om2)
+    # kappa = vol_K / vol_CY from the same measure, not a second numpy pass
+    _, _, det = measure_all(cyd, z)
+    kappa = float(np.mean(w * det / om2) / np.mean(w))
     n_train = int((1.0 - val_split) * len(z))
     X = np.concatenate([z.real, z.imag], axis=-1)
     y = np.stack([w, om2], axis=-1)
