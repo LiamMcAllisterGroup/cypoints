@@ -168,7 +168,7 @@ def fs_rank(cyd: CYData, z: ArrayLike, tol: float = 1e-8) -> int:
 
 
 def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, method: str = "jax",
-           walkers: int = 4096, **mc) -> tuple:
+           walkers: int = 8192, **mc) -> tuple:
     """
     Points, weights, Omega and pullbacks on a general toric hypersurface.
 
@@ -194,7 +194,7 @@ def sample(cyd: CYData, n_p: int, seed: int = 0, verbose: int = 3, method: str =
         above 2), default 3. For method="jax": 1 prints the tuning.
     method : {"jax", "numpy"}, optional
     walkers : int, optional
-        Chains run together by the JAX sampler. Defaults to 4096.
+        Chains run together by the JAX sampler. Defaults to 8192.
     **mc
         step_size, burn_in, thin for the chain.
 

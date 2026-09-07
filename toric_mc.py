@@ -58,37 +58,66 @@ def _patches(cyd: CYData) -> tuple:
     return tuple(out)
 
 
-def _make_programs(cyd: CYData):
+def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = True,
+                   mixed: bool = True, polish_iters: int = 1):
     """
     The jitted pieces for one geometry: Q and dQ/dz, patch normalisation,
     |Omega|^2, one Metropolis-Hastings step, and the batched Newton projection
     of arbitrary ambient points. All batched over walkers.
+
+    newton_iters : Newton iterations per projection; with `mixed` the first
+        ones run in complex64 and the last `polish_iters` in complex128
+        (GeForce float64 is 1/64 of float32 throughput, and the projection is
+        half the step). The step accepts only proposals whose relative
+        residual is below 1e-9 afterwards.
+    normalize_steps : normalise to a patch after every step (cymetric's
+        chain does); the density |Omega|^2 is evaluated in that patch.
     """
     E   = np.asarray(cyd.exponents)
-    cfs = jnp.asarray(cyd.coefficients, dtype=jnp.complex128)
+    c128 = jnp.asarray(cyd.coefficients, dtype=jnp.complex128)
+    c64  = c128.astype(jnp.complex64)
+    CE128 = c128[:, None] * jnp.asarray(E, dtype=jnp.complex128)   # (n_mon, N): coefficient x exponent
+    CE64  = CE128.astype(jnp.complex64)
     Q   = jnp.asarray(cyd.glsm, dtype=jnp.float64)
     patches = _patches(cyd)
     N   = cyd.ncoords
 
-    def q_dq(z):                                              # (W, N) -> (W,), (W, N)
-        mons = poly.monomials(z, E, None, jnp)                # (W, n_mon)
-        return mons @ cfs, poly.gradient(z, E, cfs, xp=jnp)
+    def q_dq(z):                                              # (W, N) -> (W,), (W, N); dtype of z
+        mons = poly.monomials(z, E, None, jnp)                # one monomial pass serves Q and dQ
+        cf, ce = (c64, CE64) if z.dtype == jnp.complex64 else (c128, CE128)
+        return mons @ cf, (mons @ ce) / z
+
+    PC    = jnp.asarray([pc for pc, _ in patches])                      # (n_patch, h11)
+    QINV  = jnp.asarray(np.stack([Qi for _, Qi in patches]), dtype=jnp.float64)   # (n_patch, h11, h11)
+
+    def choose_patch(z):
+        """Per walker the admissible patch with the smallest max |z| after rescaling
+        (as toric.normalize), decided in complex64: only the choice is needed here."""
+        z32 = z.astype(jnp.complex64); Q32 = Q.astype(jnp.float32)
+        best_size = jnp.full(z.shape[0], jnp.inf, dtype=jnp.float32); best = jnp.zeros(z.shape[0], jnp.int32)
+        for i, (pc, Qinv) in enumerate(patches):
+            pc = jnp.asarray(pc); Qinv = jnp.asarray(Qinv, dtype=jnp.float32)
+            zp  = z32[:, pc]
+            ok  = (jnp.abs(zp) > 1e-30).all(axis=1)
+            mu  = -jnp.log(jnp.where(ok[:, None], zp, 1.0)) @ Qinv
+            sc  = jnp.exp(mu @ Q32) * z32
+            good = ok & jnp.isfinite(sc).all(axis=1) & ((jnp.abs(sc) > 1e-30) | (jnp.abs(z32) == 0)).all(axis=1)
+            size = jnp.where(good, jnp.abs(sc).max(axis=1), jnp.inf).astype(jnp.float32)
+            take = size < best_size
+            best = jnp.where(take, i, best); best_size = jnp.where(take, size, best_size)
+        return best
 
     def normalize(z):
-        """Per walker the admissible patch with the smallest max |z| (as toric.normalize)."""
-        best_size = jnp.full(z.shape[0], jnp.inf); best = z
-        for pc, Qinv in patches:
-            pc = jnp.asarray(pc); Qinv = jnp.asarray(Qinv)
-            zp  = z[:, pc]
-            ok  = (jnp.abs(zp) > 1e-300).all(axis=1)
-            mu  = -jnp.log(jnp.where(ok[:, None], zp, 1.0)) @ Qinv        # (W, h11)
-            sc  = jnp.exp(mu @ Q) * z
-            sc  = sc.at[:, pc].set(1.0)
-            good = ok & jnp.isfinite(sc).all(axis=1) & ((jnp.abs(sc) > 1e-150) | (jnp.abs(z) == 0)).all(axis=1)
-            size = jnp.where(good, jnp.abs(sc).max(axis=1), jnp.inf)
-            take = size < best_size
-            best = jnp.where(take[:, None], sc, best); best_size = jnp.where(take, size, best_size)
-        return best
+        """The exact (complex128) C* rescaling into the chosen patch; pivots set to 1."""
+        i    = choose_patch(z)
+        pc   = PC[i]                                                       # (W, h11)
+        zp   = jnp.take_along_axis(z, pc, axis=1)
+        mu   = jnp.einsum("wa,wab->wb", -jnp.log(zp), QINV[i])              # (W, h11)
+        sc   = jnp.exp(mu @ Q) * z
+        # pivots to exactly 1 with a one-hot mask, not a scatter (an XLA scatter here
+        # made the step 60x slower)
+        piv  = (jnp.arange(N)[None, None, :] == pc[:, :, None]).any(axis=1)      # (W, N)
+        return jnp.where(piv, 1.0 + 0j, sc)
 
     def omega2(z, dq):
         """|Omega|^2 = 1/|dQ/dz_j|^2, j the largest |dQ| among the coordinates not equal to 1."""
@@ -97,15 +126,25 @@ def _make_programs(cyd: CYData):
         d    = jnp.take_along_axis(dq, j[:, None], axis=1)[:, 0]
         return 1.0 / jnp.abs(d) ** 2
 
-    def project(z, iters):
-        """Minimum-norm Newton projection onto Q = 0 (nhyper = 1): z -= conj(dQ) Q / |dQ|^2."""
+    def newton(z, iters):
         def body(_, zc):
             q, dq = q_dq(zc)
             return zc - jnp.conj(dq) * (q / jnp.sum(jnp.abs(dq) ** 2, axis=1))[:, None]
-        z = jax.lax.fori_loop(0, iters, body, z)
-        q, dq = q_dq(z)
-        scale = jnp.abs(poly.monomials(z, E, None, jnp) * cfs).sum(axis=1)
-        return z, dq, jnp.abs(q) / scale                      # relative residual
+        return jax.lax.fori_loop(0, iters, body, z)
+
+    def residual(z):
+        mons = poly.monomials(z, E, None, jnp)
+        return jnp.abs(mons @ c128) / jnp.abs(mons * c128).sum(axis=1)
+
+    def project(z, iters):
+        """Minimum-norm Newton projection onto Q = 0 (nhyper = 1): z -= conj(dQ) Q / |dQ|^2.
+        Mixed: complex64 iterations first, then `polish_iters` in complex128."""
+        if mixed and iters > polish_iters:
+            z = newton(z.astype(jnp.complex64), iters - polish_iters).astype(jnp.complex128)
+            z = newton(z, polish_iters)
+        else:
+            z = newton(z, iters)
+        return z, residual(z)
 
     @jax.jit
     def step(z, key, step_size):
@@ -115,8 +154,9 @@ def _make_programs(cyd: CYData):
         pi_old = omega2(z, dq)
         w   = jax.random.normal(k1, z.shape) + 1j * jax.random.normal(k2, z.shape)
         w   = w - jnp.conj(dq) * (jnp.sum(dq * w, axis=1) / jnp.sum(jnp.abs(dq) ** 2, axis=1))[:, None]
-        zp, dqp, res = project(z + step_size * w, 6)
-        zp  = normalize(zp)
+        zp, res = project(z + step_size * w, newton_iters)
+        if normalize_steps:
+            zp = normalize(zp)                                 # exact rescaling: stays on Q = 0
         _, dqp = q_dq(zp)
         pi_new = omega2(zp, dqp)
         ok  = (res < 1e-9) & jnp.isfinite(pi_new) & (pi_new > 0)
@@ -128,79 +168,114 @@ def _make_programs(cyd: CYData):
     def initial(key, n):
         """Random ambient points Newton-projected onto the hypersurface and normalised."""
         z = jax.random.normal(key, (n, N)) + 1j * jax.random.normal(jax.random.fold_in(key, 1), (n, N))
-        z, _, res = project(z, 25)
-        return normalize(z), res
+        z, _ = project(z, 25)
+        z = normalize(z)
+        return z, residual(z)
 
     return step, initial, normalize
 
 
 # the sampler
 # ===========
-def sample(cyd: CYData, n_p: int, seed: int = 0, walkers: int = 4096, step_size: float | None = None,
+class Sampler:
+    """
+    Persistent batched chains for one geometry: tune once, then draw as often
+    as wanted, each draw continuing the chains (no pilot, no burn-in again).
+    A moduli scan re-tunes per point (the step size depends on the
+    coefficients), but repeated draws at one point, e.g. a training set and
+    an integration set, share the tuning and the warm walkers.
+
+    Parameters
+    ----------
+    cyd : CYData
+    walkers : int
+        Independent chains stepped together. Throughput saturates around
+        8k-32k on a 5090.
+    seed : int
+    step_size, thin, burn_in : as `sample`; None tunes / estimates.
+    target_rate : float
+        Acceptance the step size is tuned to. Defaults to 0.65.
+    verbose : int
+    """
+
+    def __init__(self, cyd: CYData, walkers: int = 8192, seed: int = 0, step_size: float | None = None,
+                 thin: int | None = None, burn_in: int | None = None, target_rate: float = 0.65,
+                 verbose: int = 0):
+        if not jax.config.jax_enable_x64:
+            raise RuntimeError("toric_mc needs jax_enable_x64 (the Newton polish is float64)")
+        self.step, self.initial, _ = _make_programs(cyd)
+        self.key = jax.random.PRNGKey(seed)
+        z, res = self.initial(self.key, walkers)
+        bad = np.asarray(res) > 1e-9
+        for _ in range(5):                                     # re-project stragglers from fresh draws
+            if not bad.any():
+                break
+            self.key, k = jax.random.split(self.key)
+            z2, res2 = self.initial(k, walkers)
+            z = jnp.where(bad[:, None], z2, z); bad &= np.asarray(res2) > 1e-9
+        self.z = z[~bad] if bad.any() else z
+
+        self.step_size = 0.1 if step_size is None else step_size
+        if step_size is None:                                  # rounds of pilot steps, scaled by observed / target acceptance
+            for r in range(8):
+                rate = np.mean([self._advance() for _ in range(25)])
+                self.step_size = float(np.clip(self.step_size * rate / target_rate, 1e-6, 2.0))
+                if verbose:
+                    print(f"  pilot round {r}: acceptance {rate:.2f}, step {self.step_size:.4f}", flush=True)
+        if thin is None:                                       # integrated autocorrelation time of |z|^2
+            series = []
+            for _ in range(400):
+                self._advance(); series.append(np.asarray(jnp.sum(jnp.abs(self.z) ** 2, axis=1)))
+            thin = _iac(np.array(series))
+        self.thin = thin
+        self.burn_in = max(100, 10 * thin) if burn_in is None else burn_in
+        for _ in range(self.burn_in):
+            self._advance()
+        if verbose:
+            print(f"  step {self.step_size:.4f}, thin {self.thin}, burn-in {self.burn_in}, walkers {self.z.shape[0]}", flush=True)
+
+    def _advance(self) -> float:
+        self.key, k = jax.random.split(self.key)
+        self.z, acc = self.step(self.z, k, self.step_size)
+        return float(acc.mean())
+
+    def draw(self, n_p: int) -> np.ndarray:
+        """
+        n_p points, all walkers kept every `thin` steps, chains continued.
+
+        Returns
+        -------
+        out : ndarray of shape (n_p, ncoords), complex128, GLSM-normalised
+        """
+        out = []
+        while sum(len(o) for o in out) < n_p:
+            for _ in range(self.thin):
+                self._advance()
+            out.append(np.asarray(self.z))
+        return np.concatenate(out)[:n_p]
+
+
+def sample(cyd: CYData, n_p: int, seed: int = 0, walkers: int = 8192, step_size: float | None = None,
            thin: int | None = None, burn_in: int | None = None, target_rate: float = 0.65,
            verbose: int = 0) -> np.ndarray:
     """
     n_p points on the toric hypersurface distributed as |Omega|^2, from
-    `walkers` independent Metropolis-Hastings chains stepped together.
+    `walkers` independent Metropolis-Hastings chains stepped together
+    (`Sampler(...).draw(n_p)`).
 
     The move is cymetric's (Gaussian in the holomorphic tangent space, Newton
     projection back to Q = 0, patch normalisation, accept on the |Omega|^2
     ratio), the tuning heuristics too: a pilot chain scales the step to
     `target_rate` acceptance, the integrated autocorrelation time of |z|^2
     (Geyer's initial positive sequence, averaged over walkers) sets `thin`,
-    and `burn_in` defaults to max(100, 10 thin). Every `thin` steps all
-    walkers are kept, so the chain runs about (burn_in + thin n_p / walkers)
-    steps in total. Requires JAX x64.
+    and `burn_in` defaults to max(100, 10 thin). The Newton iterations and the
+    patch choice run in complex64 with a complex128 polish. Requires JAX x64.
 
     Returns
     -------
     out : ndarray of shape (n_p, ncoords), complex128, GLSM-normalised
     """
-    if not jax.config.jax_enable_x64:
-        raise RuntimeError("toric_mc.sample needs jax_enable_x64 (the Newton projection is float64)")
-    step, initial, _ = _make_programs(cyd)
-    key = jax.random.PRNGKey(seed)
-    z, res = initial(key, walkers)
-    bad = np.asarray(res) > 1e-9
-    if bad.any():                                             # re-project the stragglers from fresh draws
-        for _ in range(5):
-            z2, res2 = initial(jax.random.fold_in(key, 7), walkers)
-            z = jnp.where(bad[:, None], z2, z); bad &= np.asarray(res2) > 1e-9
-            if not bad.any():
-                break
-    z = z[~bad] if bad.any() else z
-
-    # step size: rounds of pilot steps, scaled by observed / target acceptance
-    s = 0.1 if step_size is None else step_size
-    if step_size is None:
-        for r in range(8):
-            acc = 0.0
-            for i in range(25):
-                key, k = jax.random.split(key); z, a = step(z, k, s); acc += float(a.mean())
-            rate = acc / 25
-            s = float(np.clip(s * rate / target_rate, 1e-6, 2.0))
-            if verbose:
-                print(f"  pilot round {r}: acceptance {rate:.2f}, step {s:.4f}", flush=True)
-
-    # thinning: integrated autocorrelation time of |z|^2 over a pilot, averaged over walkers
-    if thin is None:
-        n_pilot = 400; series = []
-        for i in range(n_pilot):
-            key, k = jax.random.split(key); z, _ = step(z, k, s)
-            series.append(np.asarray(jnp.sum(jnp.abs(z) ** 2, axis=1)))
-        thin = _iac(np.array(series))
-    burn = max(100, 10 * thin) if burn_in is None else burn_in
-    for i in range(burn):
-        key, k = jax.random.split(key); z, _ = step(z, k, s)
-    if verbose:
-        print(f"  step {s:.4f}, thin {thin}, burn-in {burn}, walkers {z.shape[0]}", flush=True)
-
-    out = []
-    while sum(len(o) for o in out) < n_p:
-        for i in range(thin):
-            key, k = jax.random.split(key); z, _ = step(z, k, s)
-        out.append(np.asarray(z))
-    return np.concatenate(out)[:n_p]
+    return Sampler(cyd, walkers, seed, step_size, thin, burn_in, target_rate, verbose).draw(n_p)
 
 
 def _iac(series: np.ndarray, max_lag: int | None = None) -> int:
