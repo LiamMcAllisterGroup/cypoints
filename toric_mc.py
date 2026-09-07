@@ -16,12 +16,18 @@
 # =============================================================================
 #
 # -----------------------------------------------------------------------------
-# Description:  cymetric's tangent-space Metropolis-Hastings sampler of |Omega|^2
-#               on a toric hypersurface, batched over many independent walkers
-#               in JAX: one jitted program per chain step for all walkers, so
-#               the thinning steps cost milliseconds for the whole batch instead
-#               of a Python step per point. Same move, same target, same tuning
-#               heuristics as cymetric.pointgen.pointgen_mc; needs x64.
+# Description:  Metropolis-Hastings sampler of |Omega ^ Omega-bar| on a toric
+#               hypersurface, batched over many independent walkers in JAX: one
+#               jitted program per chain step for all walkers, so the thinning
+#               steps cost milliseconds for the whole batch instead of a Python
+#               step per point. The move is the exact manifold move of Zappa,
+#               Holmes-Cerfon and Goodman (2018) within the walker's GLSM chart,
+#               with the chart's surface-measure Jacobian and the orbifold
+#               constant |det Q[:, pivots]| (measure.chart_factor) in the
+#               kernel densities, so the chain is unbiased at any step size;
+#               cymetric's move (pointgen.pointgen_mc, biased by the O(1)
+#               factor det J J^dagger) is kept as `exact=False`. Tuning
+#               heuristics as cymetric's; needs x64.
 # -----------------------------------------------------------------------------
 
 # external imports
@@ -81,6 +87,16 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
         chart's Hermitian surface measure to the |Omega|^2 coordinate measure
         (measured on the tetraquadric against the exact line sampler, and 20-40%
         volume errors on an h11 = 3 polytope where charts change often).
+
+    Returns
+    -------
+    step : callable
+        `step(z, key, step_size) -> (z, accepted)`, jitted, for all walkers.
+    initial : callable
+        `initial(key, n) -> (z, residual)`: n random ambient points projected
+        onto Q = 0 and normalised.
+    normalize : callable
+        The batched `toric.normalize`.
     """
     E   = np.asarray(cyd.exponents)
     c128 = jnp.asarray(cyd.coefficients, dtype=jnp.complex128)
@@ -90,7 +106,6 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
     Q   = jnp.asarray(cyd.glsm, dtype=jnp.float64)
     patches = _patches(cyd)
     N   = cyd.ncoords
-    DIM = int(cyd.dim)
 
     def q_dq(z):                                              # (W, N) -> (W,), (W, N); dtype of z
         mons = poly.monomials(z, E, None, jnp)                # one monomial pass serves Q and dQ
@@ -133,9 +148,16 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
         piv  = (jnp.arange(N)[None, None, :] == pc[:, :, None]).any(axis=1)      # (W, N)
         return jnp.where(piv, 1.0 + 0j, sc)
 
+    def is_pivot(z):
+        """The chart's pivots: the coordinates `normalize` / `rescale_to` set to exactly 1 + 0j.
+        Exact comparison, not isclose: a non-pivot coordinate that wanders within 1e-5 of 1 would
+        otherwise be mistaken for a pivot (no chart matches, the walker's slice loses a direction)."""
+        return z == 1.0 + 0j
+
     def omega2(z, dq):
-        """|Omega|^2 = 1/|dQ/dz_j|^2, j the largest |dQ| among the coordinates not equal to 1."""
-        free = ~jnp.isclose(z, 1.0 + 0j)
+        """|Omega|^2 = 1/|dQ/dz_j|^2, j the largest |dQ| among the non-pivot coordinates
+        (cymetric's formula, without the chart factor; only the `exact=False` move uses it)."""
+        free = ~is_pivot(z)
         j    = jnp.argmax(jnp.where(free, jnp.abs(dq), -1.0), axis=1)
         d    = jnp.take_along_axis(dq, j[:, None], axis=1)[:, 0]
         return 1.0 / jnp.abs(d) ** 2, j
@@ -181,8 +203,8 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
             lam = jax.lax.fori_loop(0, iters, body, lam)
         return z0 + lam[:, None] * n
 
-    def surface_jacobian(z, dq, pivots):
-        """S_c(z) = sum over the chart's non-pivot coordinates of |dQ/dz_a|^2: the density of the
+    def surface_jacobian(dq, pivots):
+        """S_c = sum over the chart's non-pivot coordinates of |dQ/dz_a|^2: the density of the
         chart's Hermitian surface measure on X relative to |Omega ^ Omega-bar| (= |Omega|^2 det J J^dagger)."""
         return jnp.sum(jnp.where(pivots, 0.0, jnp.abs(dq) ** 2), axis=1)
 
@@ -223,7 +245,7 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
         w  = jax.random.normal(k1, z.shape) + 1j * jax.random.normal(k2, z.shape)   # CN(0, 2 I): |v|^2 uses 1/2
         log_u = jnp.log(jnp.maximum(jax.random.uniform(k3, (W,)), 1e-300))
         q, dq = q_dq(z)
-        piv_c = jnp.isclose(z, 1.0 + 0j)
+        piv_c = is_pivot(z)
         v  = tangent(dq, w, piv_c)
         if not exact:
             v  = tangent(dq, w, jnp.zeros_like(piv_c))          # cymetric: the ambient tangent Gaussian
@@ -240,22 +262,22 @@ def _make_programs(cyd: CYData, newton_iters: int = 6, normalize_steps: bool = T
         i_c = jnp.argmax((PIVM[None, :, :] == piv_c[:, None, :]).all(axis=2), axis=1)   # the state's chart
         y  = project_along(z + step_size * v, n, newton_iters)
         res = residual(y)
-        qy, dqy = q_dq(y)
+        _, dqy = q_dq(y)
         # kernel density w.r.t. |Omega ^ Omega-bar|: exp(-|v|^2) S_c(y) / k_c^2, k_c = |det Q[:, pivots]|
         # (|Omega|^2 = k_c^2 / |dQ_j|^2 in an orbifold chart, measure.chart_factor)
-        log_fwd = -0.5 * jnp.sum(jnp.abs(v) ** 2, axis=1) + jnp.log(surface_jacobian(y, dqy, piv_c)) - 2.0 * LOGK[i_c]
+        log_fwd = -0.5 * jnp.sum(jnp.abs(v) ** 2, axis=1) + jnp.log(surface_jacobian(dqy, piv_c)) - 2.0 * LOGK[i_c]
         # reverse move, in y's canonical chart
         i  = choose_patch(y)
         yc, piv_cp = rescale_to(y, i)
         xc, _      = rescale_to(z, i)
-        qyc, dqyc = q_dq(yc)
+        _, dqyc = q_dq(yc)
         nyc = jnp.conj(jnp.where(piv_cp, 0.0, dqyc))
         d   = xc - yc
         vr  = tangent(dqyc, d, piv_cp)
         xr  = project_along(yc + vr, nyc, newton_iters)
         rev_ok = jnp.max(jnp.abs(xr - xc), axis=1) < 1e-8 * jnp.maximum(1.0, jnp.max(jnp.abs(xc), axis=1))
-        qxc, dqxc = q_dq(xc)
-        log_rev = -0.5 * jnp.sum(jnp.abs(vr) ** 2, axis=1) / step_size ** 2 + jnp.log(surface_jacobian(xc, dqxc, piv_cp)) - 2.0 * LOGK[i]
+        _, dqxc = q_dq(xc)
+        log_rev = -0.5 * jnp.sum(jnp.abs(vr) ** 2, axis=1) / step_size ** 2 + jnp.log(surface_jacobian(dqxc, piv_cp)) - 2.0 * LOGK[i]
         log_r = log_rev - log_fwd
         ok  = (res < 1e-9) & rev_ok & jnp.isfinite(log_r) & jnp.all(jnp.isfinite(yc), axis=1)
         acc = ok & (log_u < log_r)
@@ -293,6 +315,8 @@ class Sampler:
     target_rate : float
         Acceptance the step size is tuned to. Defaults to 0.65.
     verbose : int
+    **programs
+        Forwarded to `_make_programs` (`exact`, `newton_iters`, `mixed`, ...).
     """
 
     def __init__(self, cyd: CYData, walkers: int = 8192, seed: int = 0, step_size: float | None = None,
@@ -360,13 +384,23 @@ def sample(cyd: CYData, n_p: int, seed: int = 0, walkers: int = 8192, step_size:
     `walkers` independent Metropolis-Hastings chains stepped together
     (`Sampler(...).draw(n_p)`).
 
-    The move is cymetric's (Gaussian in the holomorphic tangent space, Newton
-    projection back to Q = 0, patch normalisation, accept on the |Omega|^2
-    ratio), the tuning heuristics too: a pilot chain scales the step to
-    `target_rate` acceptance, the integrated autocorrelation time of |z|^2
-    (Geyer's initial positive sequence, averaged over walkers) sets `thin`,
-    and `burn_in` defaults to max(100, 10 thin). The Newton iterations and the
-    patch choice run in complex64 with a complex128 polish. Requires JAX x64.
+    The move is the exact manifold Metropolis-Hastings move of
+    `_make_programs` (tangent Gaussian in the walker's chart, projection along
+    the fixed slice normal, reverse-move check, acceptance on the ratio of the
+    kernel densities with respect to |Omega ^ Omega-bar|); the tuning
+    heuristics are cymetric's: a pilot chain scales the step to `target_rate`
+    acceptance, the integrated autocorrelation time of |z|^2 (Geyer's initial
+    positive sequence, averaged over walkers) sets `thin`, and `burn_in`
+    defaults to max(100, 10 thin). The Newton iterations and the patch choice
+    run in complex64 with a complex128 polish. Requires JAX x64.
+
+    Parameters
+    ----------
+    cyd : CYData
+    n_p : int
+    seed, walkers, step_size, thin, burn_in, target_rate, verbose : as `Sampler`
+    **programs
+        Forwarded to `_make_programs` (`exact=False` for cymetric's move).
 
     Returns
     -------
@@ -379,12 +413,17 @@ def _iac(series: np.ndarray, max_lag: int | None = None) -> int:
     """
     Integrated autocorrelation time of a batch of chains (steps, walkers) by
     Geyer's initial positive sequence, averaged over walkers; at least 1.
+    Walkers whose series is constant (every proposal rejected) have no
+    autocorrelation function and are left out of the average.
     """
     x = series - series.mean(axis=0, keepdims=True)
     n = x.shape[0]
     f = np.fft.rfft(x, n=2 * n, axis=0)
     acf = np.fft.irfft(f * np.conj(f), axis=0)[:n]
-    acf = (acf / acf[0]).mean(axis=1)                        # average over walkers
+    moving = acf[0] > 0
+    if not moving.any():
+        return 1
+    acf = (acf[:, moving] / acf[0, moving]).mean(axis=1)     # average over the walkers that moved
     max_lag = n // 2 if max_lag is None else max_lag
     tau = 1.0
     for k in range(1, max_lag - 1, 2):                        # sum pairs while positive

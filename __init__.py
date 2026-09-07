@@ -23,7 +23,8 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .geometry import CYData, extract_cy, exps_sections, product_cy
+from .geometry import (CYData, extract_cy, exps_sections, product_cy,
+                       generator_coefficients)
 from .pointgen import generate_points, projective_factors, rescale
 from .measure  import (weights, omega, pullbacks, fs_metric,
                        fs_generators, assignments)
@@ -40,6 +41,7 @@ __all__ = [
     "extract_cy",
     "exps_sections",
     "product_cy",
+    "generator_coefficients",
     "generate_points",
     "projective_factors",
     "rescale",

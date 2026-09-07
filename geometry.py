@@ -58,7 +58,7 @@ class CYData:
     glsm:          np.ndarray  # (h11, ncoords) GLSM charges
     kappa:         np.ndarray  # (h11,)*3 triple intersection numbers
     divisor_basis: np.ndarray  # (h11,) inds into rays of the basis divisors
-    kc_rays:       np.ndarray  # (n_gen, h11) Kahler cone rays, in basis
+    kc_rays:       np.ndarray  # (n_gen, h11) generators of Kcup, in basis; see generator_coefficients
 
     # derived
     patch_masks: np.ndarray | None  # (n_cones, ncoords) 0 iff scalable to 1
@@ -86,9 +86,10 @@ def extract_cy(fan,
         Complex-structure moduli, one per monomial. None draws IID standard
         normals. Defaults to None.
     kahler : ArrayLike | None, optional
-        Kahler moduli, shape (h11,), in the divisor basis. None draws
-        normally about the tip of the stretched Kahler cone, redrawing until
-        inside. Defaults to None.
+        The Kahler class J, shape (h11,), in the divisor basis. None draws
+        the tip of the stretched Kahler cone (`kahler_cone(in_basis=True)`,
+        i.e. Kcup) plus a random non-negative combination of its generators.
+        Defaults to None.
     seed : int, optional
         Seed for the random moduli. Defaults to 0.
 
@@ -120,11 +121,14 @@ def extract_cy(fan,
         coefficients = np.asarray(coefficients, dtype=np.complex128)
 
     if kahler is None:
+        # the stretched-cone tip plus a random non-negative combination of the
+        # generators: inside the cone by construction. (Rejection sampling of
+        # tip + Gaussian noise never terminated at h11 >= 8: with 26 hyperplanes
+        # in 8 dimensions no draw of 200k landed inside.)
         kc  = fan.kahler_cone(in_basis=True)
         tip = kc.tip_of_stretched_cone(1)
-        t   = tip + rng.standard_normal(tip.shape[0])
-        while not np.all(kc.hyperplanes() @ t >= 1):
-            t = tip + rng.standard_normal(tip.shape[0])
+        u   = rng.uniform(0.0, 1.0, kc_rays.shape[0]) / kc_rays.shape[0]
+        t   = tip + u @ np.asarray(kc_rays, dtype=np.float64)
     else:
         t = np.asarray(kahler, dtype=np.float64)
 
@@ -227,7 +231,7 @@ def product_cy(dims: ArrayLike, seed: int = 0) -> CYData:
 def generator_coefficients(cyd: CYData) -> np.ndarray:
     """
     Coefficients t_alpha >= 0 of the Kahler class in the Kahler-cone
-    generators, kc_rays^T t = cyd.kahler.
+    generators (`cyd.kc_rays`, the generators of Kcup), kc_rays^T t = cyd.kahler.
 
     The Fubini-Study form sum_alpha t_alpha omega_alpha, cymetric's kmoduli
     and the toric samplers want these, not the components of J in the

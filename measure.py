@@ -17,7 +17,9 @@
 #
 # -----------------------------------------------------------------------------
 # Description:  The Monte-Carlo integration measure on a toric CY
-#               hypersurface: Omega, the pullback, det(g_FS) and the weights.
+#               hypersurface: Omega (the Poincare residue with the chart
+#               factor |det Q[:, pivots]| of orbifold charts), the pullback,
+#               det(g_FS) and the weights.
 # -----------------------------------------------------------------------------
 
 # external imports
@@ -170,8 +172,9 @@ def eliminated_coord(cyd: CYData, z: ArrayLike,
 def omega(cyd: CYData, z: ArrayLike, j_elim: ArrayLike | None = None,
           dQ: ArrayLike | None = None) -> np.ndarray:
     """
-    Holomorphic volume form by the Poincare residue, Omega = 1/(dQ/dz_j) with
-    j the eliminated coordinate.
+    Holomorphic volume form by the Poincare residue, Omega = k_c/(dQ/dz_j)
+    with j the eliminated coordinate and k_c the `chart_factor` of the point's
+    chart (1 on every chart of a product of projective spaces).
 
     Parameters
     ----------
@@ -252,7 +255,7 @@ def _has_orbifold_charts(cyd: CYData) -> bool:
                 break
         try:
             object.__setattr__(cyd, "_orbifold_charts", flag)
-        except Exception:
+        except (AttributeError, TypeError):       # a holder without settable attributes: recompute each call
             pass
     return bool(flag)
 

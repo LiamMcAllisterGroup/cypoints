@@ -17,11 +17,16 @@
 #
 # -----------------------------------------------------------------------------
 # Description:  The general toric backend of the sampler: points on any
-#               Kreuzer-Skarke hypersurface by cymetric's Metropolis-Hastings
-#               chain, GLSM patch normalisation, uniform weights, and the
-#               dataset / basis writers for cymetric's toric metric models.
-#               The tetraquadric keeps `pointgen` / `gpu` / `dataset`; nothing
-#               here is on that path.
+#               Kreuzer-Skarke hypersurface by the exact manifold
+#               Metropolis-Hastings chain of `toric_mc` (cymetric's serial
+#               chain as the biased `method="numpy"` reference), GLSM patch
+#               normalisation, uniform weights normalised to kappa(J, J, J) at
+#               J = cyd.kahler, the diagnostics of the Fubini-Study ansatz
+#               (`basepoint_free`, `fs_generator_ranks`, `fs_rank`), the
+#               intersection numbers in the generator basis, and the dataset /
+#               basis writers for cymetric's toric metric models. The
+#               tetraquadric keeps `pointgen` / `gpu` / `dataset`; nothing here
+#               is on that path.
 # -----------------------------------------------------------------------------
 
 # external imports
@@ -41,7 +46,7 @@ from .dataset import compute_kappa, dqdz_basis
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike
 
-    from .geometry import generator_coefficients, CYData
+    from .geometry import CYData
 
 
 # cymetric's toric_data
@@ -60,11 +65,13 @@ def toric_data(cyd: CYData) -> dict:
     -------
     out : dict
         dim_cy, vol_j_norm, coeff_aK, exp_aK, exps_sections, patch_masks,
-        glsm_charges, non_ci_*, int_nums.
+        glsm_charges, non_ci_*, int_nums (in the Kahler-cone generator basis,
+        `generator_intersection_numbers`, which is what cymetric contracts
+        its per-generator kmoduli with).
     """
     if cyd.simps is None:
         raise ValueError("toric_data needs the fan's maximal cones; use extract_cy(fan)")
-    kappa = np.asarray(cyd.kappa)
+    kappa = generator_intersection_numbers(cyd)
     simps = np.asarray(cyd.simps)
     masks = np.ones((simps.shape[0], cyd.ncoords), dtype=int)   # 0 on the cone's rays
     for row, cone in zip(masks, simps):
@@ -145,6 +152,28 @@ def normalize(cyd: CYData, z: ArrayLike) -> np.ndarray:
     return out
 
 
+def generator_intersection_numbers(cyd: CYData) -> np.ndarray:
+    """
+    Triple intersection numbers in the Kahler-cone generator basis,
+    kappa_abc = sum R_ai R_bj R_ck kappa_ijk, R = cyd.kc_rays.
+
+    cymetric's toric model contracts INTNUMS with its kmoduli, one per
+    Fubini-Study factor, i.e. per generator; with more generators than h11
+    (non-simplicial cones) or kc_rays != identity the divisor-basis numbers
+    do not match. kappa(t, t, t) here equals kappa(J, J, J) in the basis.
+
+    Parameters
+    ----------
+    cyd : CYData
+
+    Returns
+    -------
+    out : ndarray of shape (n_gen, n_gen, n_gen), float
+    """
+    K = np.asarray(cyd.kappa, dtype=np.float64); R = np.asarray(cyd.kc_rays, dtype=np.float64)
+    return np.einsum("ijk,ai,bj,ck->abc", K, R, R, R)
+
+
 def basepoint_free(cyd: CYData) -> list:
     """
     Whether each Kahler-cone generator's sections have no common zero on the
@@ -155,12 +184,15 @@ def basepoint_free(cyd: CYData) -> list:
     coordinates (it is then non-zero at sigma's fixed point). The section-norm
     Fubini-Study form omega_a = ddbar log sum_k |s_k|^2 of such a generator is
     a smooth form in the class D_a, so int_X omega_a omega_b omega_c equals
-    the intersection number for every base-point-free triple. cytools' Kahler
-    cone of the Calabi-Yau is larger than the toric one, and its extra
-    generators are nef on X only: their sections have common zeros on the
-    ambient (often meeting X), omega_a is singular there and the volume
-    identity fails for monomials containing it -- by 10-40% on the h11 = 3..8
-    polytopes of benchmarks/h11_scan, independent of the sampler.
+    the intersection number for every base-point-free triple. Base-point
+    freeness is nefness on the toric variety, i.e. membership in the FRST's
+    toric_kahler_cone (its nef cone); `cyd.kc_rays` are the generators of
+    Kcup, the union of those chambers over all FRSTs giving the same CY
+    (`fan.kahler_cone(in_basis=True)`), and the generators outside our chamber
+    are nef on X only: their sections have common zeros on the ambient (often
+    meeting X), omega_a is singular there and the volume identity fails for
+    monomials containing it -- by 10-40% on the h11 = 3..8 polytopes of
+    benchmarks/h11_scan, independent of the sampler.
 
     Parameters
     ----------
@@ -369,7 +401,7 @@ def prepare_basis(cyd: CYData, dirname: str, kappa: float = 1.0) -> dict:
         "KMODULI":    generator_coefficients(cyd),
         "NFOLD":      cyd.dim,
         "NHYPER":     1,
-        "INTNUMS":    np.asarray(cyd.kappa),
+        "INTNUMS":    generator_intersection_numbers(cyd),   # generator basis, to match KMODULI
         "KAPPA":      kappa,
         "TORIC_DATA": toric_data(cyd),
     }

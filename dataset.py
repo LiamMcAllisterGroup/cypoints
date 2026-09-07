@@ -37,7 +37,7 @@ from .pointgen import generate_points, projective_factors
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike
 
-    from .geometry import generator_coefficients, CYData
+    from .geometry import CYData
 
 
 # main entry points
