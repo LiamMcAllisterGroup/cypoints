@@ -127,7 +127,31 @@ def _pb_om(z, dq, dim):
     return J + elim * coef[:, :, None], dj[:, 0]
 
 
-def measure_all(cyd: CYData, z, chunk: int = 4096) -> tuple:
+_DS_BUDGET = 2 * 10 ** 9      # bytes allowed for the (chunk, ncoords, n_sections) array
+
+
+def _auto_chunk(ncoords: int, n_sections: int, cap: int = 4096) -> int:
+    """Points per pass keeping `_fs_one`'s widest intermediate near `_DS_BUDGET`.
+
+    Parameters
+    ----------
+    ncoords : int
+    n_sections : int
+        Sections of the widest generator.
+    cap : int, optional
+        Never exceed this. Defaults to 4096, the historical fixed value.
+
+    Returns
+    -------
+    int
+        A multiple of 64 in [64, cap].
+    """
+    per = max(1, ncoords * n_sections * 16)               # bytes per point, complex128
+    n   = int(_DS_BUDGET // per) // 64 * 64
+    return int(min(cap, max(64, n)))
+
+
+def measure_all(cyd: CYData, z, chunk: int = 0) -> tuple:
     """
     |Omega|^2, the pullbacks and every generator's pulled-back Fubini-Study
     form at the points, in one pass per chunk.
@@ -138,7 +162,12 @@ def measure_all(cyd: CYData, z, chunk: int = 4096) -> tuple:
     z : ArrayLike of shape (n_p, ncoords), complex
         Canonical chart representatives (`toric.normalize`).
     chunk : int, optional
-        Points per jitted call. Defaults to 4096.
+        Points per jitted call. Zero, the default, picks it from the widest
+        generator so the (chunk, ncoords, n_sections) monomial derivative in
+        `_fs_one` stays near `_DS_BUDGET` (2 GB), capped at 4096: a fan whose sections
+        are few (the tetraquadric) still gets exactly 4096 as before, while an
+        h11 = 17 fan with 6794 sections in one generator would otherwise ask for
+        9.4 GB there and leave cuBLAS no room to autotune.
 
     Returns
     -------
@@ -150,6 +179,8 @@ def measure_all(cyd: CYData, z, chunk: int = 4096) -> tuple:
     """
     from . import measure as _m
     E, c, SS = _static(cyd)
+    if not chunk:
+        chunk = _auto_chunk(int(cyd.ncoords), max(int(np.shape(S)[0]) for S in SS))
     z   = jnp.asarray(np.asarray(z), dtype=jnp.complex128)
     kc  = jnp.asarray(_m.chart_factor(cyd, np.asarray(z)))
     om, pbs, G = [], [], []
@@ -161,6 +192,53 @@ def measure_all(cyd: CYData, z, chunk: int = 4096) -> tuple:
         pbs.append(J)
         G.append(jnp.stack([jnp.einsum("xai,xij,xbj->xab", J, _fs_one(zc, S), jnp.conj(J)) for S in SS]))
     return jnp.concatenate(om), jnp.concatenate(pbs), jnp.concatenate(G, axis=1)
+
+
+def integrand_means(cyd: CYData, z, T, chunk: int = 2048, t_chunk: int = 16) -> tuple:
+    """
+    Means over the points of det g_FS(t)|_X / |Omega|^2 for every class in T, plus the
+    per-point values of the first class.
+
+    `integrand` materialises (n_t, n_p) and, on the way, a (n_t, n_gen, n_p, 3, 3)
+    broadcast: 201 classes on 100k points of an h11 = 17 fan asked for 17.8 GB. Here the
+    points are chunked and the classes batched, so only (t_chunk, chunk, 3, 3) is live and
+    the means accumulate.
+
+    Parameters
+    ----------
+    cyd : CYData
+    z : ArrayLike of shape (n_p, ncoords), complex
+    T : ArrayLike of shape (n_t, n_gen), float
+    chunk : int, optional
+        Points per pass. Defaults to 2048.
+    t_chunk : int, optional
+        Classes per pass. Defaults to 16.
+
+    Returns
+    -------
+    means : ndarray of shape (n_t,), float
+    first : ndarray of shape (n_p,), float
+        The per-point integrand of T[0], for its spread.
+    """
+    from . import measure as _m
+    E, c, SS = _static(cyd)
+    z  = jnp.asarray(np.asarray(z), dtype=jnp.complex128)
+    kc = jnp.asarray(_m.chart_factor(cyd, np.asarray(z)))
+    T  = jnp.asarray(np.atleast_2d(np.asarray(T, dtype=np.float64)))
+    tot   = np.zeros(T.shape[0]); first = []
+    for i in range(0, z.shape[0], chunk):
+        zc   = z[i:i + chunk]
+        _, d = _dq(zc, E, c)
+        J, dj = _pb_om(zc, d, int(cyd.dim))
+        om2  = jnp.real(dj * jnp.conj(dj)) / kc[i:i + chunk] ** 2      # 1/|Omega|^2
+        G    = jnp.stack([jnp.einsum("xai,xij,xbj->xab", J, _fs_one(zc, S), jnp.conj(J)) for S in SS])
+        for a in range(0, T.shape[0], t_chunk):
+            Tb = T[a:a + t_chunk].astype(G.dtype)
+            q  = jnp.real(jnp.linalg.det(jnp.einsum("ta,axij->txij", Tb, G))) * om2[None]
+            tot[a:a + t_chunk] += np.asarray(jnp.sum(q, axis=1))
+            if a == 0:
+                first.append(np.asarray(q[0]))
+    return tot / z.shape[0], np.concatenate(first)
 
 
 def integrand(cyd: CYData, z, T, chunk: int = 4096) -> jnp.ndarray:
