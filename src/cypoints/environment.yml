@@ -26,4 +26,4 @@ dependencies:
     # GPU variants (optional)
     # - jax[cuda12]
     # cross-checking the weights against an independent implementation
-    # - cymetric @ git+https://github.com/natemacfadden/cymetric.git
+    # - cymetric @ git+https://github.com/ruehlef/cymetric.git

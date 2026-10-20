@@ -36,8 +36,11 @@ jax = ["jax"]
 # at a small fraction of fp32, so the GPU path is mixed precision by design.
 gpu = ["jax[cuda12]"]
 # the independent cross-check of the weights in the slow tests
-cymetric = ["cymetric @ git+https://github.com/natemacfadden/cymetric.git"]
+cymetric = ["cymetric @ git+https://github.com/ruehlef/cymetric.git"]
 test = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/LiamMcAllisterGroup/cypoints"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
