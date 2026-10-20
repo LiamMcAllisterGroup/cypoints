@@ -32,7 +32,7 @@ from .dataset  import (prepare_dataset, prepare_basis, compute_kappa,
                        coord_permutation)
 
 try:
-    __version__ = version("extensionmetric")
+    __version__ = version("cypoints")
 except PackageNotFoundError:   # running from a source tree without an install
     __version__ = "0.0.0+unknown"
 

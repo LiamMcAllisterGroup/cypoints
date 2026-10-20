@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+# One import package under src/: point sampling and integration weights on
+# toric Calabi-Yau hypersurfaces. The core is numpy-only; cytools and
+# latticepts are needed to build a CYData from a fan (`extract_cy`), and the
+# GPU variants (`cypoints.gpu`, `cypoints.toric_gpu`) need the [jax] extra.
+[project]
+name = "cypoints"
+version = "0.1.0"
+description = "Point sampling and integration weights on toric Calabi-Yau hypersurfaces"
+authors = [{ name = "Nate MacFadden for the Liam McAllister Group" }]
+readme = "README.md"
+license = "GPL-3.0-or-later"
+keywords = ["Calabi-Yau", "point sampling", "Monte Carlo", "toric geometry", "numerical metrics", "JAX"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "cytools>=1.4.12",
+    "latticepts>=0.3",
+]
+requires-python = ">=3.12"
+
+[project.optional-dependencies]
+# cypoints.gpu and cypoints.toric_gpu: JAX on the CPU ...
+jax = ["jax"]
+# ... or with the CUDA 12 wheels, which is what every number in benchmarks/
+# was measured with (jax 0.10.2, RTX 5090 / 5060 Ti). Consumer cards run fp64
+# at a small fraction of fp32, so the GPU path is mixed precision by design.
+gpu = ["jax[cuda12]"]
+# the independent cross-check of the weights in the slow tests
+cymetric = ["cymetric @ git+https://github.com/natemacfadden/cymetric.git"]
+test = ["pytest"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cypoints = ["environment.yml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "slow: needs cymetric, and builds a second point generator",
+    "gpu: needs jax with a working accelerator",
+]
