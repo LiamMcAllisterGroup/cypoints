@@ -4,8 +4,12 @@ Point sampling and integration weights on toric Calabi-Yau hypersurfaces.
 
 Monte-Carlo point sets with correct integration weights are the input to every
 numerical Calabi-Yau metric. This package provides them: two samplers, the
-measure, and datasets in the layout `cymetric`'s models expect. The core is
-numpy-only; the GPU variants need JAX.
+measure, and datasets in the layout `cymetric`'s models expect.
+
+The measure and the line-method sampler are pure numpy. The toric
+Metropolis chain is JAX, so general toric fans need the `[jax]` or `[gpu]`
+extra; `toric.sample(method="numpy")` is not a numpy fallback but a wrapper
+around cymetric's serial chain, kept for comparison and biased (see below).
 
 Split out of a private research repository, where it is the sampling layer under
 a heterotic Yukawa pipeline. Nothing here depends on that application.
@@ -15,12 +19,14 @@ a heterotic Yukawa pipeline. Nothing here depends on that application.
 ```bash
 mamba env create -f src/cypoints/environment.yml --yes   # or your own env
 conda activate cypoints
-pip install -e .            # core, numpy only
-pip install -e '.[gpu]'     # with the JAX CUDA 12 wheels, for cypoints.gpu / toric_gpu
+pip install -e .            # measure + line sampler, numpy only
+pip install -e '.[jax]'     # adds the toric chain and the GPU measure, JAX on CPU
+pip install -e '.[gpu]'     # the same with the JAX CUDA 12 wheels
 ```
 
-`cytools` and `latticepts` are needed to build a geometry from a fan; the
-sampling and measure themselves are plain numpy.
+`cytools` and `latticepts` build a geometry from a fan. Python is capped below
+3.15 in `environment.yml` because cytools pins `ortools`, which has no 3.15
+wheel yet.
 
 ## Quickstart
 
@@ -106,7 +112,7 @@ src/cypoints/
   gpu.py         the line sampler and measure on the GPU
   dataset.py     cymetric-compatible dataset.npz / basis.pickle
   poly.py        polytope helpers
-tests/           13 tests; -m "not slow and not gpu" for the numpy core
+tests/           -m "not slow and not gpu" for the numpy core (22 pass, 12 skip)
 benchmarks/
   toric_mc/      sampler profiling
 ```
@@ -119,7 +125,8 @@ pytest -m "not slow and not gpu"        # numpy core only
 ```
 
 `slow` needs `cymetric` (an independent cross-check of the weights); `gpu` needs
-JAX with a working accelerator.
+JAX with a working accelerator. Tests that need JAX or cymetric skip themselves
+when the extra is absent, so a core install gives a green run.
 
 ## License
 

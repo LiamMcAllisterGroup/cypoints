@@ -43,6 +43,7 @@ def _rel_residual(cyd, z):
 @pytest.fixture(scope="module")
 def ks2():
     """A non-product KS fan with h11 = 2 (P^4 blown up along a plane) and a 1000-point sample."""
+    pytest.importorskip("cymetric", reason="the fixture samples with cymetric's serial chain")
     cyd = _cy(KS2)
     z, w, om, pbs = toric.sample(cyd, 1000, seed=1, method="numpy")   # cymetric's serial chain (chart-biased; the 5% tests allow it)
     return cyd, z, w, om, pbs
@@ -101,6 +102,7 @@ def test_uniform_weights_integrate_the_fs_volume_at_any_t(ks2):
 
 def test_quintic_matches_line_sampler_volume():
     """On P^4 both samplers exist: the MC path reproduces the line method's volume."""
+    pytest.importorskip("jax", reason="the toric chain is the jax sampler")
     from cypoints import generate_points, weights
     cyd = _cy(QUINTIC)
     z, w, om, pbs = toric.sample(cyd, 800, seed=2)
@@ -137,6 +139,7 @@ def test_exact_chain_matches_the_line_sampler_on_the_tetraquadric():
     """Where the line sampler exists, the chain's distribution must agree with it on
     a chart-sensitive observable: det(J J^dagger), the factor by which cymetric's
     move is biased (its E[det] is 2.16 against 2.02 here)."""
+    pytest.importorskip("jax", reason="the toric chain is the jax sampler")
     from cypoints import generate_points, weights
     cyd = _cy([[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1],[-1,0,0,0],[0,-1,0,0],[0,0,-1,0],[0,0,0,-1]])
     E = np.asarray(cyd.exponents); c = np.asarray(cyd.coefficients)
@@ -164,6 +167,7 @@ def test_orbifold_charts_carry_the_residue_factor():
     """This h11 = 3 polytope has a chart with |det Q[:, pivots]| = 4 (its slice is a 4-fold
     cover of the affine patch). There Omega = det(Q_pc) dz_free / (dQ/dz_j); without the factor
     (cymetric's formula) the base-point-free generators' cubics came out 0.70, 0.46, 0.69."""
+    pytest.importorskip("jax", reason="the toric chain is the jax sampler")
     from cypoints.toric_mc import _patches
     cyd = _cy([[1,0,0,0],[-1,0,0,0],[0,1,0,0],[0,0,1,0],[-2,-1,-1,0],[0,0,0,1],[2,-1,0,-1]])
     Q = np.asarray(cyd.glsm, float)
@@ -184,7 +188,7 @@ def test_orbifold_charts_carry_the_residue_factor():
 def test_toric_gpu_matches_the_numpy_measure(ks2):
     """`toric_gpu` reproduces `measure`'s Omega, pullbacks and generator forms, and its
     integrand integrates to the intersection numbers at classes it was not normalised at."""
-    import jax
+    jax = pytest.importorskip("jax")
     if not any(d.platform == "gpu" for d in jax.devices()):
         pytest.skip("no GPU")
     from cypoints import toric_gpu
@@ -224,6 +228,7 @@ def test_generator_coefficients_nonsimplicial():
 # dataset and basis
 # =================
 def test_prepare_dataset_and_basis_toric(tmp_path):
+    pytest.importorskip("jax", reason="the toric chain is the jax sampler")
     cyd   = _cy(KS2)
     kappa = toric.prepare_dataset(cyd, 600, str(tmp_path), seed=1)
     basis = toric.prepare_basis(cyd, str(tmp_path), kappa)

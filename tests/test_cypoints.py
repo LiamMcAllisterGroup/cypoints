@@ -130,6 +130,7 @@ def test_matches_cymetric(tetraquadric):
     The weights must agree with cymetric's independent CICY implementation on
     the same points, not merely up to a convention.
     """
+    pytest.importorskip("cymetric")
     from cymetric.pointgen.pointgen import PointGenerator
 
     cyd  = tetraquadric
@@ -248,7 +249,7 @@ def test_gpu_measure_all_matches_cpu(tetraquadric):
 
 def test_prepare_dataset_gpu_layout(tetraquadric, tmp_path):
     """The GPU path writes the same layout with a sane kappa (skipped without a GPU)."""
-    import jax
+    jax = pytest.importorskip("jax")
     from cypoints import prepare_dataset
     try:
         jax.devices("gpu")
